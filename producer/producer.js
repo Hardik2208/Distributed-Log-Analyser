@@ -8,8 +8,8 @@ const kafka = new Kafka({
 
 const producer = kafka.producer();
 
-const TOTAL_MESSAGES = 100000;
-const RATE_PER_SEC = 10000;
+const TOTAL_MESSAGES = 1000;
+const RATE_PER_SEC = 100;
 
 // 🔴 Service → Endpoint mapping
 const SERVICE_MAP = {

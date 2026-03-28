@@ -32,22 +32,37 @@ app.get('/metrics', async (req, res) => {
       const requestCount = parseInt(data.request_count || 0);
       const errorCount = parseInt(data.error_count || 0);
       const totalLatency = parseInt(data.total_latency || 0);
-
-      // 🔴 NEW FIELD
+      const totalIngestionLatency = parseInt(data.total_ingestion_latency || 0);
       const totalPipelineLatency = parseInt(data.total_pipeline_latency || 0);
+
+      // 🔴 ADD THESE (CRITICAL)
+      const originalCount = parseInt(data.original_count || 0);
+      const retryCount = parseInt(data.retry_count || 0);
+
+      const retryAmplification =
+        originalCount > 0 ? retryCount / originalCount : 0;
 
       const window = key.split(':')[2];
 
       results.push({
         window,
+
         request_count: requestCount,
         error_count: errorCount,
         failure_rate: requestCount > 0 ? errorCount / requestCount : 0,
-        avg_latency: requestCount > 0 ? totalLatency / requestCount : 0,
 
-        // 🔴 ADD THIS
+        avg_latency:
+          requestCount > 0 ? totalLatency / requestCount : 0,
+
         avg_pipeline_latency:
-          requestCount > 0 ? totalPipelineLatency / requestCount : 0
+          requestCount > 0 ? totalPipelineLatency / requestCount : 0,
+
+        // 🔴 ADD THESE OUTPUTS
+        original_count: originalCount,
+        retry_count: retryCount,
+        retry_amplification: retryAmplification,
+        avg_ingestion_latency:
+          requestCount > 0 ? totalIngestionLatency / requestCount : 0
       });
     }
 
