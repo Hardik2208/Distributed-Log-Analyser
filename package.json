@@ -1,0 +1,25 @@
+{
+  "name": "log-analyser",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "producer": "node producer/producer.js",
+    "mainConsumer": "node consumer/mainConsumer.js",
+    "retryConsumer": "node consumer/retryConsumer.js",
+    "dlqConsumer": "node consumer/dlqConsumer.js",
+    "dev": "concurrently \"npm run producer\" \"npm run mainConsumer\" \"npm run retryConsumer\" \"npm run dlqConsumer\"",
+    "start": "bash scripts/start-all.sh"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "concurrently": "^9.2.1",
+    "express": "^5.2.1",
+    "kafkajs": "^2.2.4",
+    "redis": "^5.11.0",
+    "uuid": "^13.0.0"
+  }
+}
