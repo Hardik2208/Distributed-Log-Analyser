@@ -2,99 +2,179 @@ const { Kafka } = require('kafkajs');
 const { v4: uuidv4 } = require('uuid');
 
 const kafka = new Kafka({
-  clientId: 'load-producer',
+  clientId: 'adaptive-producer',
   brokers: ['localhost:9092'],
 });
 
 const producer = kafka.producer();
+const controlConsumer = kafka.consumer({ groupId: 'producer-control' });
 
-const TOTAL_MESSAGES = 1000;
-const RATE_PER_SEC = 100;
+// --------------------------------
+// CONTROL STATE (EXTERNALIZED)
+// --------------------------------
+let baseRate = 1000;          // internal growth/shrink
+let externalFactor = 1.0;     // from control loop
 
-// 🔴 Service → Endpoint mapping
-const SERVICE_MAP = {
-  auth: ["/login", "/signup"],
-  payment: ["/pay", "/refund"],
-  order: ["/create", "/status"]
-};
+const MIN_RATE = 100;
+const MAX_RATE = 5000;
 
-// 🔴 Utility functions
-function pick(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
+// --------------------------------
+// SERVICE CONFIG
+// --------------------------------
+const SERVICE = "order";
 
+// --------------------------------
+// UTILS
+// --------------------------------
 function random(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// 🔴 Controlled status distribution
-function getStatus() {
+// 🔴 REALISTIC LATENCY DISTRIBUTION
+function realisticLatency() {
   const r = Math.random();
-  if (r < 0.7) return 200;   // 70%
-  if (r < 0.9) return 400;   // 20%
-  return 500;                // 10%
+
+  if (r < 0.7) return random(50, 120);
+  if (r < 0.9) return random(120, 300);
+  return random(300, 800);
 }
 
-// 🔴 Latency correlated with service + status
-function getLatency(service, status) {
-  if (status >= 500) return random(200, 800);
+// 🔴 WEIGHTED ENDPOINTS
+const endpoints = [
+  { path: "/create", weight: 0.5 },
+  { path: "/update", weight: 0.3 },
+  { path: "/fetch", weight: 0.2 }
+];
 
-  if (service === "auth") return random(20, 100);
-  if (service === "payment") return random(50, 200);
-  if (service === "order") return random(100, 400);
+function pickEndpoint() {
+  const r = Math.random();
+  let sum = 0;
 
-  return random(50, 300); // fallback
+  for (const e of endpoints) {
+    sum += e.weight;
+    if (r <= sum) return e.path;
+  }
+  return "/create";
 }
 
+// --------------------------------
+// 🔴 CONTROL SIGNAL CONSUMER
+// --------------------------------
+async function startControlConsumer() {
+  await controlConsumer.connect();
+  await controlConsumer.subscribe({ topic: 'control-signals', fromBeginning: false });
+
+  await controlConsumer.run({
+    eachMessage: async ({ message }) => {
+      try {
+        const signal = JSON.parse(message.value.toString());
+
+        if (signal.type === "RATE_ADJUST") {
+          externalFactor = signal.factor;
+
+          console.log(
+            `🎯 CONTROL SIGNAL → factor=${externalFactor}`
+          );
+        }
+
+      } catch (err) {
+        console.error("❌ CONTROL PARSE ERROR", err);
+      }
+    }
+  });
+}
+
+// --------------------------------
+// 🔴 MAIN PRODUCER LOOP
+// --------------------------------
 async function run() {
   await producer.connect();
+  await startControlConsumer();
 
-  let sent = 0;
+  while (true) {
 
-  const interval = setInterval(async () => {
-    for (let i = 0; i < RATE_PER_SEC; i++) {
-      if (sent >= TOTAL_MESSAGES) {
-        clearInterval(interval);
-        console.log("✅ Load test completed");
-        await producer.disconnect();
-        return;
-      }
+    // --------------------------------
+    // 1. APPLY CONTROL FACTOR
+    // --------------------------------
+    let adjustedRate = baseRate * externalFactor;
 
-      const service = pick(Object.keys(SERVICE_MAP));
-      const endpoint = pick(SERVICE_MAP[service]);
-      const status = getStatus();
+    adjustedRate = Math.max(MIN_RATE, Math.min(MAX_RATE, adjustedRate));
+
+    // --------------------------------
+    // 2. BURST TRAFFIC
+    // --------------------------------
+    let burstMultiplier = 1;
+
+    if (Math.random() < 0.1) {
+      burstMultiplier = random(2, 5);
+      console.log(`🚀 BURST x${burstMultiplier}`);
+    }
+
+    const effectiveRate = Math.min(
+      MAX_RATE,
+      Math.floor(adjustedRate * burstMultiplier)
+    );
+
+    // --------------------------------
+    // 3. BUILD BATCH
+    // --------------------------------
+    const batch = [];
+
+    for (let i = 0; i < effectiveRate; i++) {
 
       const log = {
         id: uuidv4(),
         trace_id: uuidv4(),
-
         timestamp: Date.now(),
 
-        service,
-        endpoint,
-        method: pick(["GET", "POST"]),
+        service: SERVICE,
+        endpoint: pickEndpoint(),
+        method: "POST",
 
-        status_code: status,
-        latency_ms: getLatency(service, status),
+        status_code: 200,
+        latency_ms: realisticLatency(),
 
-        user_id: "user_" + random(1, 1000),
-        region: pick(["ap-south-1", "us-east-1", "eu-west-1"]),
+        // slight bad data (real-world noise)
+        user_id: Math.random() < 0.02 ? null : "user_" + random(1, 5000),
 
+        region: "ap-south-1",
         retry_count: 0
       };
 
-      await producer.send({
-        topic: 'logs',
-        messages: [{ value: JSON.stringify(log) }],
-      });
-
-      sent++;
+      batch.push({ value: JSON.stringify(log) });
     }
 
-    console.log(`Sent: ${sent}`);
-  }, 1000);
+    // --------------------------------
+    // 4. SEND
+    // --------------------------------
+    await producer.send({
+      topic: 'logs',
+      messages: batch,
+    });
+
+    console.log(
+      `📤 Sent=${batch.length} | base=${Math.floor(baseRate)} | factor=${externalFactor.toFixed(2)}`
+    );
+
+    // --------------------------------
+    // 5. NATURAL DRIFT (OPTIONAL BUT REALISTIC)
+    // --------------------------------
+    if (Math.random() < 0.3) {
+      baseRate *= random(95, 105) / 100; // small drift
+      baseRate = Math.max(MIN_RATE, Math.min(MAX_RATE, baseRate));
+    }
+
+    // --------------------------------
+    // 6. VARIABLE DELAY
+    // --------------------------------
+    const delay = random(700, 1300);
+    await new Promise(res => setTimeout(res, delay));
+  }
 }
 
+// --------------------------------
+// START
+// --------------------------------
 run().catch(err => {
   console.error("🔥 PRODUCER CRASHED:", err);
 });
