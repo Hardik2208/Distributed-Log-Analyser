@@ -1,6 +1,6 @@
 const { Kafka } = require('kafkajs');
-const pLimit = require('p-limit');
-
+const pLimit = require('p-limit').default;
+const { recordAmplification } = require('../metrics/metricsService');
 const { connectRedis } = require('../config/redisClient');
 const { processLog } = require('../processing/processLog');
 
@@ -9,30 +9,29 @@ const kafka = new Kafka({
   brokers: ['localhost:9092'],
 });
 
-const consumer = kafka.consumer({ groupId: 'log-group-main' });
+const consumer = kafka.consumer({
+  groupId: 'log-group-main',
+  sessionTimeout: 30000,
+  heartbeatInterval: 3000,
+  maxWaitTimeInMs: 10,
+  minBytes: 1,
+});
+
 const producer = kafka.producer();
 
-const limit = pLimit(50);
+// 🔥 CONCURRENCY
+const limit = pLimit(100);
 
-let paused = false;
+// ----------------------
+async function commitOffset(topic, partition, message) {
+  await consumer.commitOffsets([{
+    topic,
+    partition,
+    offset: (Number(message.offset) + 1).toString(),
+  }]);
+}
 
-// 🔴 GLOBAL CONTROL HOOKS
-global.pauseMainConsumer = async () => {
-  if (!paused) {
-    consumer.pause([{ topic: 'logs' }]);
-    paused = true;
-    console.log("⏸️ MAIN CONSUMER PAUSED");
-  }
-};
-
-global.resumeMainConsumer = async () => {
-  if (paused) {
-    consumer.resume([{ topic: 'logs' }]);
-    paused = false;
-    console.log("▶️ MAIN CONSUMER RESUMED");
-  }
-};
-
+// ----------------------
 async function run() {
   await connectRedis();
   await consumer.connect();
@@ -40,8 +39,11 @@ async function run() {
 
   await consumer.subscribe({ topic: 'logs', fromBeginning: false });
 
+  console.log("🚀 MAIN CONSUMER STARTED");
+
   await consumer.run({
     autoCommit: false,
+    partitionsConsumedConcurrently: 3,
 
     eachMessage: async ({ topic, partition, message }) => {
 
@@ -52,36 +54,111 @@ async function run() {
         try {
           log = JSON.parse(message.value.toString());
 
+          // ----------------------
+          // 🔥 ATTEMPT TRACKING (ORIGINAL)
+          // ----------------------
+          await recordAmplification(false);
+
+          // ----------------------
+          // 🔥 NORMALIZATION
+          // ----------------------
           log.retry_count = log.retry_count || 0;
           log.ingestion_latency = Date.now() - log.timestamp;
 
-          await processLog(log);
+          // 🔥 FIX: ATTEMPT TIMESTAMP (CRITICAL)
+          log.attempt_timestamp = log.timestamp;
 
-        } catch (err) {
+          // ----------------------
+          // 🔥 PROCESS
+          // ----------------------
+          const result = await processLog(log);
 
-          if (log && log.retry_count === 0) {
+          if (result?.status === "SUCCESS") {
+            console.log(`✅ SUCCESS ${log.id}`);
+          } 
+          else if (result?.status === "SKIPPED_ALREADY_PROCESSED") {
+            // duplicate — ignore
+          }
+          else if (result?.status === "ERROR_CLAIM_FAILED") {
+
+            // ----------------------
+            // 🔥 SAFE RETRY (CLAIM FAILURE)
+            // ----------------------
             await producer.send({
               topic: 'logs-retry',
               messages: [{
+                key: log.id,
                 value: JSON.stringify({
                   ...log,
                   retry_count: 1,
-                  source: "RETRY"
+                  retry_id: `${log.id}-r1`,
+                  next_retry_at: Date.now() + 500,
+                  attempt_timestamp: Date.now(), // 🔥 important
+                  source: "CLAIM_FAILED"
                 }),
               }],
             });
+
+          } 
+          else {
+            console.log(`⚠️ UNKNOWN ${log.id}`);
+          }
+
+        } catch (err) {
+
+          if (!log) {
+            await commitOffset(topic, partition, message);
+            return;
+          }
+
+          // ----------------------
+          // 🔥 RETRY HANDLING
+          // ----------------------
+          if (err.type === "TEMPORARY") {
+
+            const currentRetry = log.retry_count || 0;
+
+            if (currentRetry >= 1) {
+              console.log(`💀 DLQ ${log.id} retry overflow`);
+              // retry consumer will take final decision
+            } else {
+
+              await producer.send({
+                topic: 'logs-retry',
+                messages: [{
+                  key: log.id,
+                  value: JSON.stringify({
+                    ...log,
+                    retry_count: 1,
+                    retry_id: `${log.id}-r1`,
+                    next_retry_at: Date.now() + 500,
+                    attempt_timestamp: Date.now(), // 🔥 important
+                    source: "MAIN_RETRY"
+                  }),
+                }],
+              });
+
+              console.log(`🔁 RETRY ${log.id} r=1`);
+            }
+
+          } else {
+            // permanent → processLog already emitted final metric
+            console.log(`💀 DLQ ${log.id} permanent`);
           }
         }
 
-        await consumer.commitOffsets([{
-          topic,
-          partition,
-          offset: (Number(message.offset) + 1).toString(),
-        }]);
+        // ----------------------
+        // 🔥 ALWAYS COMMIT OFFSET
+        // ----------------------
+        await commitOffset(topic, partition, message);
 
       });
+
     },
   });
 }
 
-run().catch(console.error);
+run().catch(err => {
+  console.error("🔥 MAIN CONSUMER FAILED:", err);
+  process.exit(1);
+});

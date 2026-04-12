@@ -1,19 +1,18 @@
-// control/backpressureConfig.js
-
 const THRESHOLDS = {
-  ENABLE: {
-    latency: 800,        // enter pressure only when degradation is real
-    retryAmp: 0.45
-  },
-
-  DISABLE: {
-    latency: 500,        // clear recovery buffer (avoid flapping)
-    retryAmp: 0.25
-  },
-
   OVERLOAD: {
-    latency: 1500,       // trigger before collapse (you saw 2500ms+)
-    retryAmp: 0.6
+    latency: 1200,
+    retryAmp: 1.8,
+    failure: 0.5
+  },
+  ENABLE: {
+    latency: 600,
+    retryAmp: 1.3,
+    failure: 0.25
+  },
+  RECOVERY: {
+    latency: 400,
+    retryAmp: 1.1,
+    failure: 0.1
   }
 };
 

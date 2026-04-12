@@ -1,6 +1,8 @@
-const { client } = require('../config/redisClient');
+const { redisClient } = require('../config/redisClient');
 
-// 🔴 UPDATED: fully consistent metric ingestion
+// ----------------------
+// UPDATE METRICS (UNIFIED + PRODUCTION SAFE)
+// ----------------------
 async function updateMetrics({
   service,
   window,
@@ -8,75 +10,91 @@ async function updateMetrics({
   isFirstAttempt,
   retryCount,
   failed,
+  success,
   latency,
   pipelineLatency,
   ingestionLatency
 }) {
-  const key = `metrics:${service}:${window}`;
+  try {
+    const key = `${service}:${window}`;
 
-  // 🔴 TRACK WINDOW (CRITICAL FIX)
-  await client.sAdd(`metrics:windows:${service}`, window);
+    const multi = redisClient.multi();
 
-  await client.hIncrBy(key, 'total_attempts', 1);
+    // 🔥 TRACK WINDOW
+    multi.sAdd(`metrics:windows:${service}`, String(window));
 
-  if (isFirstAttempt) {
-    await client.hIncrBy(key, 'original_messages', 1);
-  }
+    // ----------------------
+    // COUNTS
+    // ----------------------
+    multi.hIncrBy(key, 'count', 1);
 
-  if (isRetry) {
-    await client.hIncrBy(key, 'retry_attempts', 1);
-    await client.hIncrBy(key, 'total_retry_depth', retryCount);
-  }
+    if (success) multi.hIncrBy(key, 'success', 1);
+    if (failed) multi.hIncrBy(key, 'failure', 1);
 
-  if (failed) {
-    await client.hIncrBy(key, 'total_failures', 1);
-
-    if (isFirstAttempt) {
-      await client.hIncrBy(key, 'first_attempt_failures', 1);
-    } else {
-      await client.hIncrBy(key, 'retry_failures', 1);
-    }
-  } else {
+    // ----------------------
+    // RETRY TRACKING
+    // ----------------------
+    if (isFirstAttempt) multi.hIncrBy(key, 'original', 1);
     if (isRetry) {
-      await client.hIncrBy(key, 'retry_successes', 1);
+      multi.hIncrBy(key, 'retry', 1);
+      multi.hIncrBy(key, 'retryDepth', retryCount || 0);
     }
+
+    // ----------------------
+    // LATENCIES
+    // ----------------------
+    multi.hIncrByFloat(key, 'latency', latency || 0);
+    multi.hIncrByFloat(key, 'pipelineLatency', pipelineLatency || 0);
+    multi.hIncrByFloat(key, 'ingestionLatency', ingestionLatency || 0);
+
+    // ----------------------
+    // TTL (avoid memory leak)
+    // ----------------------
+    multi.expire(key, 3600);
+
+    await multi.exec();
+
+  } catch (err) {
+    console.error("🔥 updateMetrics FAILED:", err.message);
   }
-
-  await client.hIncrBy(key, 'total_latency', latency || 0);
-  await client.hIncrBy(key, 'total_pipeline_latency', pipelineLatency || 0);
-  await client.hIncrBy(key, 'total_ingestion_latency', ingestionLatency || 0);
-
-  await client.expire(key, 3600);
 }
 
-// 🔴 DUPLICATE CHECK
+// ----------------------
+// DUPLICATE CHECK
+// ----------------------
 async function isDuplicate(id) {
   try {
-    return await client.exists(`log:processed:${id}`);
+    return await redisClient.exists(`processed:${id}`);
   } catch (err) {
     throw { type: 'REDIS_ERROR', message: err.message };
   }
 }
 
-// 🔴 MARK PROCESSED
+// ----------------------
+// MARK PROCESSED
+// ----------------------
 async function markProcessed(id) {
   try {
-    await client.set(`log:processed:${id}`, 1, { EX: 3600 });
+    await redisClient.set(`processed:${id}`, 1, { EX: 3600 });
   } catch (err) {
     throw { type: 'REDIS_ERROR', message: err.message };
   }
 }
 
-// 🔴 SIMPLE SET TRACKING (DLQ / DEBUG)
+// ----------------------
+// GENERIC SET ADD
+// ----------------------
 async function addToSet(key, value) {
   try {
-    await client.sAdd(key, value);
+    await redisClient.sAdd(key, value);
   } catch (err) {
     throw { type: 'REDIS_ERROR', message: err.message };
   }
 }
 
-// 🔴 DLQ STORAGE (FULL CONTEXT)
+// ----------------------
+// DLQ STORAGE
+// ----------------------
 async function addToDLQ(log, reason) {
   try {
     const entry = {
@@ -94,7 +112,7 @@ async function addToDLQ(log, reason) {
 
     const dlqKey = `dlq:entry:${log.id}`;
 
-    await client.hSet(dlqKey, {
+    await redisClient.hSet(dlqKey, {
       id: entry.id,
       service: entry.service || '',
       reason: entry.reason || '',
@@ -105,25 +123,26 @@ async function addToDLQ(log, reason) {
       retry_history: JSON.stringify(entry.retry_history),
     });
 
-    await client.expire(dlqKey, 86400);
-
-    await client.sAdd('dlq_ids', log.id);
+    await redisClient.expire(dlqKey, 86400);
+    await redisClient.sAdd('dlq_ids', log.id);
 
   } catch (err) {
     throw { type: 'REDIS_ERROR', message: err.message };
   }
 }
 
-// 🔴 DLQ ANALYTICS
+// ----------------------
+// DLQ ANALYTICS
+// ----------------------
 async function getDLQStats() {
-  const ids = await client.sMembers('dlq_ids');
+  const ids = await redisClient.sMembers('dlq_ids');
   if (!ids.length) return { count: 0, entries: [] };
 
   const entries = [];
 
   for (const id of ids.slice(-50)) {
     try {
-      const data = await client.hGetAll(`dlq:entry:${id}`);
+      const data = await redisClient.hGetAll(`dlq:entry:${id}`);
 
       if (data && data.id) {
         entries.push({
@@ -141,7 +160,7 @@ async function getDLQStats() {
     ? entries.reduce((s, e) => s + e.retry_count, 0) / entries.length
     : 0;
 
-  const avgTimeInPipeline = entries.length
+  const avgTime = entries.length
     ? entries.reduce((s, e) => s + e.total_time_in_pipeline, 0) / entries.length
     : 0;
 
@@ -153,41 +172,50 @@ async function getDLQStats() {
   return {
     count: ids.length,
     avg_retries_before_dlq: parseFloat(avgRetries.toFixed(2)),
-    avg_time_in_pipeline_ms: Math.round(avgTimeInPipeline),
+    avg_time_in_pipeline_ms: Math.round(avgTime),
     by_reason: byReason,
     recent: entries.slice(-10),
   };
 }
 
-// 🔴 METRICS FETCH
+// ----------------------
+// METRICS FETCH (ALIGNED WITH BUFFER)
+// ----------------------
 async function getMetrics(service, window) {
-  const key = `metrics:${service}:${window}`;
-  const data = await client.hGetAll(key);
+  const key = `${service}:${window}`;
+  const data = await redisClient.hGetAll(key);
 
   if (!data || Object.keys(data).length === 0) return null;
 
-  const total = +data.total_attempts || 0;
-  const original = +data.original_messages || 0;
-  const retry = +data.retry_attempts || 0;
-  const failures = +data.total_failures || 0;
-  const retryDepth = +data.total_retry_depth || 0;
+  const count = +data.count || 0;
+  const success = +data.success || 0;
+  const failure = +data.failure || 0;
+  const original = +data.original || 0;
+  const retry = +data.retry || 0;
+  const retryDepth = +data.retryDepth || 0;
 
   return {
-    total_attempts: total,
-    original_messages: original,
-    retry_attempts: retry,
-    total_failures: failures,
+    total_attempts: count,
+    success,
+    failures: failure,
 
-    retry_amplification: original ? +(retry / original).toFixed(2) : 0,
+    success_rate: count ? +(success / count).toFixed(3) : 0,
+    failure_rate: count ? +(failure / count).toFixed(3) : 0,
+
+    retry_amplification: original ? +((original + retry) / original).toFixed(2) : 0,
     avg_retry_depth: retry ? +(retryDepth / retry).toFixed(2) : 0,
 
-    initial_failure_rate: original ? +(data.first_attempt_failures / original).toFixed(2) : 0,
-    overall_failure_rate: total ? +(failures / total).toFixed(2) : 0,
+    avg_pipeline_latency: count
+      ? +(data.pipelineLatency / count).toFixed(2)
+      : 0,
 
-    retry_success_rate: retry ? +(data.retry_successes / retry).toFixed(2) : 0,
-    retry_failure_rate: retry ? +(data.retry_failures / retry).toFixed(2) : 0,
+    avg_ingestion_latency: count
+      ? +(data.ingestionLatency / count).toFixed(2)
+      : 0,
 
-    avg_pipeline_latency: total ? +(data.total_pipeline_latency / total).toFixed(2) : 0,
+    avg_latency: count
+      ? +(data.latency / count).toFixed(2)
+      : 0,
   };
 }
 

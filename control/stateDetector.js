@@ -1,33 +1,85 @@
-async function applyBackpressure(state, metrics) {
+const { THRESHOLDS } = require('./backpressureConfig');
 
-  const latency = metrics.avg_pipeline_latency;
+// ----------------------
+function getSystemState(metrics, currentState) {
 
-  if (state === "OVERLOADED") {
+  const latency = metrics.avg_pipeline_latency || 0;
+  const retryAmp = metrics.retry_amplification || 0;
+  const failure = metrics.failure_rate || 0;
 
-    console.log("🚨 OVERLOADED → HARD CONTROL");
+  // ----------------------
+  // 🔥 FROM HEALTHY
+  // ----------------------
+  if (currentState === "HEALTHY") {
 
-    await global.pauseMainConsumer?.();
-    global.throttleRetryConsumer?.(0.3); // aggressive
-
-  } else if (state === "PRESSURED") {
-
-    console.log("⚠️ PRESSURED → MODERATE CONTROL");
-
-    await global.resumeMainConsumer?.();
-
-    if (latency > 1200) {
-      global.throttleRetryConsumer?.(0.5);
-    } else {
-      global.throttleRetryConsumer?.(0.7);
+    // 🔴 Direct jump to OVERLOADED
+    if (
+      latency > THRESHOLDS.OVERLOAD.latency ||
+      retryAmp > THRESHOLDS.OVERLOAD.retryAmp ||
+      failure > THRESHOLDS.OVERLOAD.failure
+    ) {
+      return "OVERLOADED";
     }
 
-  } else if (state === "HEALTHY") {
+    // 🟡 Move to PRESSURED
+    if (
+      latency > THRESHOLDS.ENABLE.latency ||
+      retryAmp > THRESHOLDS.ENABLE.retryAmp ||
+      failure > THRESHOLDS.ENABLE.failure
+    ) {
+      return "PRESSURED";
+    }
 
-    console.log("✅ HEALTHY → NORMAL FLOW");
-
-    await global.resumeMainConsumer?.();
-    global.unthrottleRetryConsumer?.();
+    return "HEALTHY";
   }
+
+  // ----------------------
+  // 🔥 FROM PRESSURED
+  // ----------------------
+  if (currentState === "PRESSURED") {
+
+    // 🔴 Escalate
+    if (
+      latency > THRESHOLDS.OVERLOAD.latency ||
+      retryAmp > THRESHOLDS.OVERLOAD.retryAmp ||
+      failure > THRESHOLDS.OVERLOAD.failure
+    ) {
+      return "OVERLOADED";
+    }
+
+    // 🟢 Recover (lower thresholds → hysteresis)
+    if (
+      latency < THRESHOLDS.RECOVERY.latency &&
+      retryAmp < THRESHOLDS.RECOVERY.retryAmp &&
+      failure < THRESHOLDS.RECOVERY.failure
+    ) {
+      return "HEALTHY";
+    }
+
+    return "PRESSURED";
+  }
+
+  // ----------------------
+  // 🔥 FROM OVERLOADED
+  // ----------------------
+  if (currentState === "OVERLOADED") {
+
+    // 🟡 Step down (NOT directly to HEALTHY)
+    if (
+      latency < THRESHOLDS.ENABLE.latency &&
+      retryAmp < THRESHOLDS.ENABLE.retryAmp &&
+      failure < THRESHOLDS.ENABLE.failure
+    ) {
+      return "PRESSURED";
+    }
+
+    return "OVERLOADED";
+  }
+
+  // ----------------------
+  // 🔥 DEFAULT SAFE STATE
+  // ----------------------
+  return "HEALTHY";
 }
 
-module.exports = { applyBackpressure };
+module.exports = { getSystemState };

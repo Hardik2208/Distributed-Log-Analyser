@@ -1,214 +1,258 @@
 const express = require('express');
-const { connectRedis, client } = require('./config/redisClient');
-const { getMetrics, getDLQStats } = require('./metrics/redisMetrics');
+const { connectRedis, redisClient } = require('./config/redisClient');
+const { getSystemMetrics } = require('./metrics/metricsService');
+const { getDLQStats } = require('./metrics/redisMetrics');
 const { startControlLoop } = require('./control/controlLoop');
-const { flushMetrics } = require('./metrics/metricsFlusher');
-const db = require('./db/db'); // 🔴 REAL DB (not fakeDb)
-
-const fakeDb = require('./db/fakeDb'); // 🔥 failure simulation
 
 const app = express();
 app.use(express.json());
 
-const DEFAULT_SERVICE = "order";
-
-// --------------------------------
-// 🔴 START CONTROL LOOP
-// --------------------------------
-startControlLoop(DEFAULT_SERVICE);
-
-// --------------------------------
-// 🔴 START METRICS FLUSHER
-// --------------------------------
-setInterval(() => {
-  flushMetrics(DEFAULT_SERVICE);
-}, 5000);
-
-// --------------------------------
-// 🔥 DB FAILURE CONTROL
-// --------------------------------
-app.post('/control/db/down', async (req, res) => {
+// ----------------------
+// 🔴 SAFE REDIS WRAPPER
+// ----------------------
+async function safeRedis(action, fallback = null) {
   try {
-    await fakeDb.enableFailure();
-    console.log("🔥 DB FAILURE ENABLED");
-    res.json({ db: "DOWN" });
+    if (!redisClient || !redisClient.isOpen) {
+      console.warn("⚠️ Redis unavailable");
+      return fallback;
+    }
+    return await action();
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("🔥 Redis error:", err.message);
+    return fallback;
   }
+}
+
+// ----------------------
+// 🔴 DB FAILURE CONTROL
+// ----------------------
+app.post('/control/db/down', async (req, res) => {
+  await safeRedis(() => redisClient.set('db:failure', '1'));
+  console.log("🔥 DB FAILURE ENABLED");
+  res.json({ db: "DOWN" });
 });
 
 app.post('/control/db/up', async (req, res) => {
-  try {
-    await fakeDb.disableFailure();
-    console.log("✅ DB RECOVERY");
-    res.json({ db: "UP" });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  await safeRedis(() => redisClient.set('db:failure', '0'));
+  console.log("✅ DB RESTORED");
+  res.json({ db: "UP" });
 });
 
-// --------------------------------
-// 🔴 REAL-TIME METRICS (REDIS)
-// --------------------------------
-
-// GET /metrics?service=order
-app.get('/metrics', async (req, res) => {
+// ----------------------
+// 🔥 SYSTEM METRICS
+// ----------------------
+app.get('/metrics/system', async (req, res) => {
   try {
-    const service = req.query.service || DEFAULT_SERVICE;
+    const metrics = await getSystemMetrics();
+    const state = await safeRedis(() => redisClient.get("system:state"));
 
-    // 🔴 NO KEYS — use tracked windows
-    const windows = await client.sMembers(`metrics:windows:${service}`);
-    if (!windows.length) {
-      return res.status(404).json({ message: 'No data found' });
+    if (!metrics) {
+      return res.json({
+        success: true,
+        state,
+        message: "No metrics yet"
+      });
     }
-
-    const results = [];
-
-    for (const window of windows) {
-      const metrics = await getMetrics(service, window);
-
-      if (metrics) {
-        results.push({ window: Number(window), ...metrics });
-      }
-    }
-
-    results.sort((a, b) => a.window - b.window);
-
-    res.json({ type: "realtime", service, windows: results });
-
-  } catch (err) {
-    console.error('❌ METRICS ERROR:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --------------------------------
-// 🔴 HISTORICAL METRICS (MYSQL)
-// --------------------------------
-
-// GET /metrics/db?service=order&limit=50
-app.get('/metrics/db', async (req, res) => {
-  try {
-    const service = req.query.service || DEFAULT_SERVICE;
-    const limit = parseInt(req.query.limit) || 50;
-
-    const [rows] = await db.pool.query(
-      `
-      SELECT *
-      FROM metrics_window
-      WHERE service = ?
-      ORDER BY window_start DESC
-      LIMIT ?
-      `,
-      [service, limit]
-    );
 
     res.json({
-      type: "historical",
-      service,
-      count: rows.length,
-      data: rows
+      success: true,
+      state,
+      ...metrics
     });
 
   } catch (err) {
-    console.error('❌ DB METRICS ERROR:', err);
+    console.error("🔥 SYSTEM METRICS ERROR:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// --------------------------------
-// 🔴 DLQ METRICS
-// --------------------------------
-app.get('/metrics/dlq', async (req, res) => {
+// ----------------------
+// 🔥 LATEST METRICS
+// ----------------------
+app.get('/metrics/latest', async (req, res) => {
+  try {
+    const service = req.query.service || 'order';
+
+    const windows = await safeRedis(
+      () => redisClient.sMembers(`metrics:windows:${service}`),
+      []
+    );
+
+    if (!windows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "No metrics yet"
+      });
+    }
+
+    const latestWindow = Math.max(
+      ...windows.map(w => Number(w)).filter(w => !isNaN(w))
+    );
+
+    const key = `${service}:${latestWindow}`;
+    const data = await safeRedis(() => redisClient.hGetAll(key), {});
+
+    if (!data || Object.keys(data).length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No metrics yet"
+      });
+    }
+
+    const count = Number(data.count || 0);
+    const latency = Number(data.latency || 0);
+    const pipelineLatency = Number(data.pipelineLatency || 0);
+    const ingestionLatency = Number(data.ingestionLatency || 0);
+
+    res.json({
+      success: true,
+      service,
+      timestamp: Date.now(),
+      window: latestWindow,
+      total_attempts: count,
+      avg_latency: count ? latency / count : 0,
+      avg_pipeline_latency: count ? pipelineLatency / count : 0,
+      avg_ingestion_latency: count ? ingestionLatency / count : 0
+    });
+
+  } catch (err) {
+    console.error("🔥 METRICS ERROR:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+// ----------------------
+// 🔥 WINDOW METRICS
+// ----------------------
+app.get('/metrics/window', async (req, res) => {
+  try {
+    const service = req.query.service || 'order';
+
+    const windows = await safeRedis(
+      () => redisClient.sMembers(`metrics:windows:${service}`),
+      []
+    );
+
+    if (!windows.length) {
+      return res.json({
+        success: true,
+        windows: []
+      });
+    }
+
+    const sortedWindows = windows
+      .map(w => Number(w))
+      .filter(w => !isNaN(w))
+      .sort((a, b) => b - a)
+      .slice(0, 10);
+
+    const result = [];
+
+    for (const window of sortedWindows) {
+      const key = `${service}:${window}`;
+      const data = await safeRedis(() => redisClient.hGetAll(key), {});
+
+      if (!data || Object.keys(data).length === 0) continue;
+
+      const count = Number(data.count || 0);
+      const success = Number(data.success || 0);
+      const failure = Number(data.failure || 0);
+
+      const latency = Number(data.latency || 0);
+      const pipelineLatency = Number(data.pipelineLatency || 0);
+      const ingestionLatency = Number(data.ingestionLatency || 0);
+
+      const original = Number(data.original || 0);
+      const retry = Number(data.retry || 0);
+
+      const retry_amplification =
+        original === 0 ? 0 : (retry / original);
+
+      result.push({
+        window,
+        total_attempts: count,
+        success,
+        failures: failure,
+        retry_amplification,
+        avg_pipeline_latency: count ? pipelineLatency / count : 0,
+        avg_ingestion_latency: count ? ingestionLatency / count : 0,
+        avg_latency: count ? latency / count : 0
+      });
+    }
+
+    res.json({
+      success: true,
+      service,
+      windows: result
+    });
+
+  } catch (err) {
+    console.error("🔥 WINDOW METRICS ERROR:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+// ----------------------
+// 🔥 DLQ STATS
+// ----------------------
+app.get('/dlq/stats', async (req, res) => {
   try {
     const stats = await getDLQStats();
-    res.json(stats);
+
+    res.json({
+      success: true,
+      stats
+    });
+
   } catch (err) {
+    console.error("🔥 DLQ ERROR:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// --------------------------------
-// 🔴 BACKPRESSURE CONTROLS
-// --------------------------------
-app.post('/control/throttle', (req, res) => {
-  if (typeof global.throttleRetryConsumer === 'function') {
-    global.throttleRetryConsumer();
-    return res.json({ throttled: true });
-  }
-  res.status(503).json({ error: 'Retry consumer not running' });
+// ----------------------
+// 🔥 HEALTH CHECK
+// ----------------------
+app.get('/health', async (req, res) => {
+  res.json({
+    status: "OK",
+    redis: redisClient?.isOpen || false,
+    timestamp: Date.now()
+  });
 });
 
-app.post('/control/unthrottle', (req, res) => {
-  if (typeof global.unthrottleRetryConsumer === 'function') {
-    global.unthrottleRetryConsumer();
-    return res.json({ throttled: false });
-  }
-  res.status(503).json({ error: 'Retry consumer not running' });
-});
-
-// --------------------------------
-// 🔴 MAIN CONSUMER CONTROL
-// --------------------------------
-app.post('/control/pause', async (req, res) => {
-  const ms = parseInt(req.query.ms) || 15000;
-
-  if (typeof global.pauseMainConsumer === 'function') {
-    await global.pauseMainConsumer();
-
-    setTimeout(() => {
-      global.resumeMainConsumer?.();
-    }, ms);
-
-    return res.json({ paused: true, resumesIn: ms });
-  }
-
-  res.status(503).json({ error: 'Main consumer not running' });
-});
-
-app.post('/control/resume', async (req, res) => {
-  if (typeof global.resumeMainConsumer === 'function') {
-    await global.resumeMainConsumer();
-    return res.json({ paused: false });
-  }
-
-  res.status(503).json({ error: 'Main consumer not running' });
-});
-
-// --------------------------------
-// 🔴 HEALTH
-// --------------------------------
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', ts: Date.now() });
-});
-
-// --------------------------------
-// 🔴 START SERVER
-// --------------------------------
+// ----------------------
+// 🚀 START SERVER
+// ----------------------
 async function start() {
   await connectRedis();
 
+  // default state
+  await redisClient.set('db:failure', '0');
+
+  // 🔥 START CONTROL LOOP AFTER REDIS
+  //startControlLoop("order");
+
   app.listen(3000, () => {
-    console.log('🚀 Server running on http://localhost:3000');
+    console.log("🚀 Server running on 3000");
 
-    console.log('\n📊 REAL-TIME METRICS (Redis)');
-    console.log('GET  /metrics?service=order');
+    console.log("📊 System:");
+    console.log("http://localhost:3000/metrics/system");
 
-    console.log('\n📊 HISTORICAL METRICS (MySQL)');
-    console.log('GET  /metrics/db?service=order&limit=50');
+    console.log("📊 Latest:");
+    console.log("http://localhost:3000/metrics/latest?service=order");
 
-    console.log('\n📊 DLQ');
-    console.log('GET  /metrics/dlq');
+    console.log("📊 Window:");
+    console.log("http://localhost:3000/metrics/window?service=order");
 
-    console.log('\n⚙️ CONTROL');
-    console.log('POST /control/throttle');
-    console.log('POST /control/unthrottle');
-    console.log('POST /control/pause?ms=15000');
-    console.log('POST /control/resume');
-
-    console.log('\n🔥 FAILURE TEST');
-    console.log('POST /control/db/down');
-    console.log('POST /control/db/up');
+    console.log("💀 DLQ:");
+    console.log("http://localhost:3000/dlq/stats");
   });
 }
 
