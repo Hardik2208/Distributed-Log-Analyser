@@ -14,40 +14,46 @@ const consumer = kafka.consumer({
   groupId: 'log-group-retry',
   sessionTimeout: 30000,
   heartbeatInterval: 3000,
-  maxWaitTimeInMs: 10,
-  minBytes: 1,
 });
 
 const producer = kafka.producer();
 
-// ----------------------
-// 🔥 DYNAMIC CONCURRENCY
-// ----------------------
-let dynamicConcurrency = 20;
+// ======================================================
+// 🔥 HIGH CONCURRENCY (NO STARVATION)
+// ======================================================
+let dynamicConcurrency = 100;
 let limiter = pLimit(dynamicConcurrency);
 
 setInterval(() => {
   try {
     const state = cachedState.systemState;
 
-    let newConcurrency = 20;
+    let newConcurrency = 100;
 
-    if (state === "OVERLOADED") newConcurrency = 5;
-    else if (state === "PRESSURED") newConcurrency = 10;
+    if (state === "OVERLOADED") newConcurrency = 30;
+    else if (state === "PRESSURED") newConcurrency = 60;
 
     if (newConcurrency !== dynamicConcurrency) {
       dynamicConcurrency = newConcurrency;
       limiter = pLimit(dynamicConcurrency);
-      console.log(`🔁 RETRY CONCURRENCY → ${dynamicConcurrency}`);
     }
   } catch {}
 }, 1000);
 
 const limit = (fn) => limiter(fn);
 
-// ----------------------
-// 🔥 CACHE SYSTEM STATE
-// ----------------------
+// ======================================================
+// 🔥 LOG SAMPLING
+// ======================================================
+const SAMPLE_RATE = 0.01;
+
+function shouldLog() {
+  return Math.random() < SAMPLE_RATE;
+}
+
+// ======================================================
+// 🔁 STATE CACHE
+// ======================================================
 let cachedState = {
   systemState: "HEALTHY",
   circuitState: "CLOSED",
@@ -66,13 +72,13 @@ setInterval(async () => {
     cachedState.circuitState = circuitState || "CLOSED";
     cachedState.avgLatency = Number(avgLatency || 0);
   } catch {}
-}, 1000);
+}, 500);
 
-// ----------------------
+// ======================================================
 const MAX_RETRY = 2;
-const LATENCY_THRESHOLD = 2000;
+const LATENCY_THRESHOLD = 1500;
 
-// ----------------------
+// ======================================================
 async function commitOffset(topic, partition, message) {
   await consumer.commitOffsets([{
     topic,
@@ -81,7 +87,7 @@ async function commitOffset(topic, partition, message) {
   }]);
 }
 
-// ----------------------
+// ======================================================
 async function run() {
   await connectRedis();
   await consumer.connect();
@@ -93,23 +99,71 @@ async function run() {
 
   await consumer.run({
     autoCommit: false,
-    partitionsConsumedConcurrently: 4,
+    partitionsConsumedConcurrently: 10,
 
-    eachMessage: async ({ topic, partition, message }) => {
+    eachMessage: async ({ topic, partition, message, heartbeat }) => {
 
       await limit(async () => {
 
         let log;
 
         try {
-          log = JSON.parse(message.value.toString());
-          const executionId = log.retry_id || log.id;
-          const now = Date.now();
+          await heartbeat();
 
-          // ----------------------
-          // ⏳ DELAY HANDLING
-          // ----------------------
-          if (log.next_retry_at && now < log.next_retry_at) {
+          log = JSON.parse(message.value.toString());
+
+          const now = Date.now();
+          const priority = log.priority || "LOW";
+
+          // ======================================================
+          // 🔴 INPUT TRACE
+          // ======================================================
+          if (shouldLog()) {
+            console.log(`📥 RETRY_IN id=${log.id} r=${log.retry_count}`);
+          }
+
+          // ======================================================
+          // 🔴 DELAY HANDLING (NON-BLOCKING)
+          // ======================================================
+          const nextRetryAt = Number(log.next_retry_at || 0);
+          const waitTime = nextRetryAt - now;
+
+          if (waitTime > 0) {
+
+            if (waitTime <= 2000) {
+
+              // record retry delay properly
+              log.retry_delay = waitTime;
+
+              await commitOffset(topic, partition, message);
+
+              setTimeout(async () => {
+                try {
+                  const execLog = {
+                    ...log,
+                    retry_count: (log.retry_count || 0) + 1,
+                    retry_id: `${log.id}-r${(log.retry_count || 0) + 1}`,
+                    attempt_timestamp: Date.now()
+                  };
+
+                  if (shouldLog()) {
+                    console.log(`🚀 RETRY_EXEC_DELAYED id=${execLog.id}`);
+                  }
+
+                  await processLog(execLog);
+
+                } catch (err) {
+                  // fallback handled in main pipeline next cycle
+                }
+              }, waitTime);
+
+              return;
+            }
+
+            // long delay → requeue
+            if (shouldLog()) {
+              console.log(`⏳ REQUEUE_LONG id=${log.id} delay=${waitTime}`);
+            }
 
             await commitOffset(topic, partition, message);
 
@@ -120,8 +174,6 @@ async function run() {
                 value: JSON.stringify({
                   ...log,
                   retry_scheduled_at: now,
-
-                  // 🔥 CRITICAL FIX
                   queue_entered_at: now
                 })
               }],
@@ -130,19 +182,23 @@ async function run() {
             return;
           }
 
-          // ----------------------
+          // ======================================================
           // 🔐 IDEMPOTENCY
-          // ----------------------
+          // ======================================================
           const exists = await redisClient.exists(`processed:${log.id}`);
           if (exists) {
             await commitOffset(topic, partition, message);
             return;
           }
 
-          // ----------------------
+          // ======================================================
           // 🔥 MAX RETRY → DLQ
-          // ----------------------
+          // ======================================================
           if (log.retry_count >= MAX_RETRY) {
+
+            if (shouldLog()) {
+              console.log(`💀 DLQ_MAX id=${log.id}`);
+            }
 
             await producer.send({
               topic: 'logs-dlq',
@@ -155,91 +211,85 @@ async function run() {
               }],
             });
 
-            console.log(`💀 DLQ ${executionId}`);
             await commitOffset(topic, partition, message);
             return;
           }
 
-          // ----------------------
-          // 🔥 BACKPRESSURE
-          // ----------------------
-          const isBlocked =
-            cachedState.systemState !== "HEALTHY" ||
+          // ======================================================
+          // 🔴 LOAD SHEDDING
+          // ======================================================
+          const isOverloaded =
             cachedState.circuitState === "OPEN" ||
-            cachedState.avgLatency >= LATENCY_THRESHOLD;
+            cachedState.systemState === "OVERLOADED" ||
+            cachedState.avgLatency > LATENCY_THRESHOLD;
 
-          if (isBlocked && Math.random() < 0.7) {
+          if (isOverloaded) {
 
-            const delay = 500 * Math.pow(2, log.retry_count);
+            if (priority === "LOW") {
+              await commitOffset(topic, partition, message);
+              return;
+            }
 
-            await producer.send({
-              topic: 'logs-retry',
-              messages: [{
-                key: log.id,
-                value: JSON.stringify({
-                  ...log,
-                  next_retry_at: now + delay,
-                  retry_scheduled_at: now,
+            if (priority === "MEDIUM") {
+              if (Math.random() > 0.2) {
+                await commitOffset(topic, partition, message);
+                return;
+              }
+            }
 
-                  // 🔥 CRITICAL FIX
-                  queue_entered_at: now,
-
-                  source: "BACKPRESSURE_DELAY"
-                }),
-              }],
-            });
-
-            await commitOffset(topic, partition, message);
-            return;
+            if (priority === "HIGH" && cachedState.avgLatency > LATENCY_THRESHOLD) {
+              if (Math.random() > 0.2) {
+                await commitOffset(topic, partition, message);
+                return;
+              }
+            }
           }
 
-          // ----------------------
-          // 🔥 CIRCUIT BREAKER
-          // ----------------------
+          // ======================================================
+          // 🔴 CIRCUIT BREAKER
+          // ======================================================
           const allowRetry = await shouldRetry();
 
           if (!allowRetry) {
 
-            await producer.send({
-              topic: 'logs-retry',
-              messages: [{
-                key: log.id,
-                value: JSON.stringify({
-                  ...log,
-                  next_retry_at: now + 1000,
-                  retry_scheduled_at: now,
+            if (priority === "LOW") {
+              await commitOffset(topic, partition, message);
+              return;
+            }
 
-                  // 🔥 CRITICAL FIX
-                  queue_entered_at: now,
+            if (priority === "MEDIUM") {
+              if (Math.random() > 0.2) {
+                await commitOffset(topic, partition, message);
+                return;
+              }
+            }
 
-                  source: "CIRCUIT_DELAY"
-                }),
-              }],
-            });
-
-            await commitOffset(topic, partition, message);
-            return;
+            if (priority === "HIGH") {
+              if (Math.random() > 0.5) {
+                await commitOffset(topic, partition, message);
+                return;
+              }
+            }
           }
 
-          // ----------------------
-          // 🔥 EXECUTION
-          // ----------------------
+          // ======================================================
+          // 🔥 EXECUTION (DIRECT)
+          // ======================================================
           const nextRetry = (log.retry_count || 0) + 1;
 
           const executionLog = {
             ...log,
             retry_count: nextRetry,
             retry_id: `${log.id}-r${nextRetry}`,
-
-            // 🔥 ONLY PLACE WHERE THIS SHOULD EXIST
-            attempt_timestamp: now
+            attempt_timestamp: Date.now(),
+            retry_delay: 0
           };
 
-          const result = await processLog(executionLog);
-
-          if (result?.status === "SUCCESS") {
-            console.log(`✅ RETRY SUCCESS ${executionId}`);
+          if (shouldLog()) {
+            console.log(`🚀 RETRY_EXEC id=${executionLog.id} r=${nextRetry}`);
           }
+
+          await processLog(executionLog);
 
           await commitOffset(topic, partition, message);
 
@@ -250,14 +300,16 @@ async function run() {
             return;
           }
 
-          const executionId = log.retry_id || log.id;
           const now = Date.now();
+          const nextRetry = (log.retry_count || 0) + 1;
 
           if (err.type === "TEMPORARY") {
 
-            const nextRetry = (log.retry_count || 0) + 1;
-
             if (nextRetry > MAX_RETRY) {
+
+              if (shouldLog()) {
+                console.log(`💀 DLQ_TEMP id=${log.id}`);
+              }
 
               await producer.send({
                 topic: 'logs-dlq',
@@ -270,11 +322,15 @@ async function run() {
                 }],
               });
 
-              console.log(`💀 DLQ ${executionId}`);
-
             } else {
 
-              const delay = 500 * Math.pow(2, nextRetry);
+              const baseDelay = 500 * Math.pow(2, nextRetry);
+              const jitter = Math.random() * 300;
+              const delay = baseDelay + jitter;
+
+              if (shouldLog()) {
+                console.log(`🔁 RETRY_AGAIN id=${log.id} delay=${Math.round(delay)}`);
+              }
 
               await producer.send({
                 topic: 'logs-retry',
@@ -285,20 +341,19 @@ async function run() {
                     retry_count: nextRetry,
                     retry_id: `${log.id}-r${nextRetry}`,
                     next_retry_at: now + delay,
-
-                    // 🔥 CRITICAL FIX
                     retry_scheduled_at: now,
                     queue_entered_at: now,
-
                     source: "RETRY_AGAIN"
                   }),
                 }],
               });
-
-              console.log(`🔁 RETRY AGAIN ${executionId}`);
             }
 
           } else {
+
+            if (shouldLog()) {
+              console.log(`💀 DLQ_PERM id=${log.id}`);
+            }
 
             await producer.send({
               topic: 'logs-dlq',
@@ -310,8 +365,6 @@ async function run() {
                 }),
               }],
             });
-
-            console.log(`💀 DLQ ${executionId}`);
           }
 
           await commitOffset(topic, partition, message);

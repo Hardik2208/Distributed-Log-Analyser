@@ -1,87 +1,14 @@
 const { getSystemState } = require('./stateDetector');
 const { applyBackpressure } = require('./actions');
 const { updateCircuit } = require('./circuitBreaker');
+const { fetchLatestMetrics } = require('./metricsFetcher'); // 🔴 UPDATED
+
 const { connectRedis, redisClient } = require('../config/redisClient');
 
 const { Kafka } = require('kafkajs');
 
 const kafka = new Kafka({ brokers: ['localhost:9092'] });
 const producer = kafka.producer();
-
-// ----------------------
-// 🔥 SMOOTHING BUFFER
-// ----------------------
-let latencyHistory = [];
-const MAX_HISTORY = 5;
-
-// ----------------------
-// 🔥 METRICS FETCH (FIXED + ALIGNED)
-// ----------------------
-async function getLatestMetrics(service) {
-  const windows = await redisClient.sMembers(`metrics:windows:${service}`);
-  if (!windows.length) return null;
-
-  const sorted = windows.map(Number).sort((a, b) => b - a);
-  const recent = sorted.slice(0, 3);
-
-  let total = 0;
-  let success = 0;
-  let failure = 0;
-  let temporary = 0;
-
-  let latencySum = 0;
-  let pipelineSum = 0;
-  let endToEndSum = 0;
-
-  let retry = 0;
-  let original = 0;
-
-  for (const w of recent) {
-    const data = await redisClient.hGetAll(`${service}:${w}`);
-    if (!data || Object.keys(data).length === 0) continue;
-
-    total += Number(data.total || 0);
-
-    success += Number(data.success || 0);
-    failure += Number(data.failure || 0);
-    temporary += Number(data.temporary || 0);
-
-    latencySum += Number(data.latencySum || 0);
-    pipelineSum += Number(data.pipelineLatencySum || 0);
-    endToEndSum += Number(data.endToEndLatencySum || 0);
-
-    retry += Number(data.retry || 0);
-    original += Number(data.original || 0);
-  }
-
-  if (total === 0) return null;
-
-  // ----------------------
-  // 🔥 SMOOTH LATENCY
-  // ----------------------
-  const currentLatency = pipelineSum / total;
-
-  latencyHistory.push(currentLatency);
-  if (latencyHistory.length > MAX_HISTORY) latencyHistory.shift();
-
-  const smoothedLatency =
-    latencyHistory.reduce((a, b) => a + b, 0) / latencyHistory.length;
-
-  return {
-    total_attempts: total,
-
-    success_rate: success / total,
-    failure_rate: failure / total,
-    temporary_failure_rate: temporary / total,
-
-    avg_latency: latencySum / total,
-    avg_pipeline_latency: smoothedLatency,
-    avg_end_to_end_latency: endToEndSum / total,
-
-    retry_amplification:
-      original === 0 ? 0 : total / original
-  };
-}
 
 // ----------------------
 async function startControlLoop(service = "order") {
@@ -96,27 +23,39 @@ async function startControlLoop(service = "order") {
   setInterval(async () => {
     try {
 
-      const metrics = await getLatestMetrics(service);
-      if (!metrics) return;
+      const metricsBundle = await fetchLatestMetrics(service);
+      if (!metricsBundle) return;
 
-      // ----------------------
-      // 🔥 1. CIRCUIT BREAKER
-      // ----------------------
-      const circuitState = await updateCircuit(metrics);
+      const { fast, smooth } = metricsBundle;
 
-      // ----------------------
-      // 🔥 2. SYSTEM STATE
-      // ----------------------
-      const newState = getSystemState(metrics, currentState);
+      if (!fast && !smooth) return;
 
-      if (newState !== currentState) {
-        console.log(`🔁 STATE: ${currentState} → ${newState}`);
-        currentState = newState;
+      // ======================================================
+      // 🔴 1. CIRCUIT BREAKER (FAST METRICS)
+      // ======================================================
+      const circuitState = await updateCircuit(fast || smooth);
+
+      // ======================================================
+      // 🔴 2. SYSTEM STATE (SMOOTH METRICS)
+      // ======================================================
+      const newState = getSystemState(smooth || fast, currentState);
+
+      // 🔴 FORCE COUPLING (CRITICAL)
+      let effectiveState = newState;
+
+      if (circuitState === "OPEN") {
+        effectiveState = "OVERLOADED";
       }
 
       // ----------------------
+      if (effectiveState !== currentState) {
+        console.log(`🔁 STATE: ${currentState} → ${effectiveState}`);
+        currentState = effectiveState;
+      }
+
+      // ======================================================
       // 🔥 3. STORE GLOBAL STATE
-      // ----------------------
+      // ======================================================
       if (prevStoredState !== currentState) {
         await redisClient.set("system:state", currentState);
         prevStoredState = currentState;
@@ -127,23 +66,31 @@ async function startControlLoop(service = "order") {
         prevCircuitState = circuitState;
       }
 
-      if (prevLatency !== metrics.avg_pipeline_latency) {
-        await redisClient.set("system:avg_latency", metrics.avg_pipeline_latency);
-        prevLatency = metrics.avg_pipeline_latency;
+      if (prevLatency !== smooth?.avg_pipeline_latency) {
+        await redisClient.set(
+          "system:avg_latency",
+          smooth?.avg_pipeline_latency || 0
+        );
+        prevLatency = smooth?.avg_pipeline_latency;
       }
 
-      // ----------------------
-      // 🔥 4. BACKPRESSURE
-      // ----------------------
-      await applyBackpressure(currentState, metrics);
+      // ======================================================
+      // 🔥 4. BACKPRESSURE (ENFORCED)
+      // ======================================================
+      await applyBackpressure(currentState, smooth || fast);
 
-      // ----------------------
-      // 🔥 5. PRODUCER CONTROL
-      // ----------------------
+      // ======================================================
+      // 🔴 5. PRODUCER CONTROL (STRONGER + COUPLED)
+      // ======================================================
       let factor = 1.0;
 
-      if (currentState === "OVERLOADED") factor = 0.3;
-      else if (currentState === "PRESSURED") factor = 0.6;
+      if (circuitState === "OPEN") {
+        factor = 0.05; // 🔴 HARD THROTTLE
+      } else if (currentState === "OVERLOADED") {
+        factor = 0.1;  // 🔴 stronger than before
+      } else if (currentState === "PRESSURED") {
+        factor = 0.5;
+      }
 
       await producer.send({
         topic: 'control-signals',
@@ -155,16 +102,16 @@ async function startControlLoop(service = "order") {
         }]
       });
 
-      // ----------------------
+      // ======================================================
       // 🔥 DEBUG (UPGRADED)
-      // ----------------------
+      // ======================================================
       console.log("📊", {
         state: currentState,
         circuit: circuitState,
-        tempFail: metrics.temporary_failure_rate.toFixed(2),
-        failure: metrics.failure_rate.toFixed(2),
-        latency: Math.round(metrics.avg_pipeline_latency),
-        retryAmp: metrics.retry_amplification.toFixed(2)
+        tempFail: (smooth?.temporary_failure_rate ?? 0).toFixed(2),
+        failure: (smooth?.failure_rate ?? 0).toFixed(2),
+        latency: Math.round(smooth?.avg_pipeline_latency ?? 0),
+        retryAmp: (smooth?.retry_amplification ?? 0).toFixed(2)
       });
 
     } catch (err) {

@@ -15,6 +15,7 @@ const controlConsumer = kafka.consumer({ groupId: 'producer-control' });
 let baseRate = 10000;
 let externalFactor = 1.0;
 
+// 🔴 FIXED (REAL CONTROL RANGE)
 const MIN_RATE = 10000;
 const MAX_RATE = 10000;
 
@@ -23,20 +24,29 @@ const MAX_RATE = 10000;
 // --------------------------------
 const SERVICE = "order";
 
-// 🔥 VALID ENDPOINTS (MATCH VALIDATOR)
+// --------------------------------
+// PRIORITY CONFIG (NEW)
+// --------------------------------
+const PRIORITY_WEIGHTS = [
+  { type: "HIGH", weight: 0.1 },   // critical logs
+  { type: "MEDIUM", weight: 0.3 },
+  { type: "LOW", weight: 0.6 }     // bulk logs
+];
+
+// --------------------------------
+// ENDPOINT CONFIG
+// --------------------------------
 const VALID_ENDPOINTS = [
   { path: "/create", weight: 0.7 },
   { path: "/status", weight: 0.3 }
 ];
 
-// 🔥 INVALID ENDPOINTS (CONTROLLED TESTING)
 const INVALID_ENDPOINTS = [
   { path: "/update", weight: 0.5 },
   { path: "/fetch", weight: 0.5 }
 ];
 
-// % of invalid traffic (important for testing)
-const INVALID_RATE = 0.2; // 20%
+const INVALID_RATE = 0.2;
 
 // --------------------------------
 // UTILS
@@ -64,12 +74,24 @@ function pickWeighted(arr) {
   return arr[0].path;
 }
 
-// 🔥 SMART ENDPOINT PICKER
+// 🔥 PRIORITY PICKER
+function pickPriority() {
+  const r = Math.random();
+  let sum = 0;
+
+  for (const p of PRIORITY_WEIGHTS) {
+    sum += p.weight;
+    if (r <= sum) return p.type;
+  }
+  return "LOW";
+}
+
+// 🔥 ENDPOINT PICKER
 function pickEndpoint() {
   if (Math.random() < INVALID_RATE) {
-    return pickWeighted(INVALID_ENDPOINTS); // intentional bad input
+    return pickWeighted(INVALID_ENDPOINTS);
   }
-  return pickWeighted(VALID_ENDPOINTS); // correct input
+  return pickWeighted(VALID_ENDPOINTS);
 }
 
 // --------------------------------
@@ -114,7 +136,7 @@ async function run() {
   while (true) {
 
     // --------------------------------
-    // 1. APPLY CONTROL FACTOR
+    // 1. APPLY CONTROL FACTOR (FIXED)
     // --------------------------------
     let adjustedRate = baseRate * externalFactor;
 
@@ -123,7 +145,7 @@ async function run() {
     const batchSize = Math.floor(adjustedRate);
 
     // --------------------------------
-    // 2. BUILD BATCH
+    // 2. BUILD BATCH (PRIORITY ADDED)
     // --------------------------------
     const batch = [];
     const now = Date.now();
@@ -131,6 +153,7 @@ async function run() {
     for (let i = 0; i < batchSize; i++) {
 
       const endpoint = pickEndpoint();
+      const priority = pickPriority();
 
       const log = {
         id: uuidv4(),
@@ -147,13 +170,11 @@ async function run() {
         user_id: Math.random() < 0.02 ? null : "user_" + random(1, 5000),
 
         region: "ap-south-1",
-        retry_count: 0
-      };
+        retry_count: 0,
 
-      // 🔥 DEBUG VISIBILITY (critical for validation testing)
-      if (Math.random() < 0.01) {
-        console.log(`🧪 SAMPLE LOG → ${log.id} | endpoint=${endpoint}`);
-      }
+        // 🔴 NEW: PRIORITY FIELD
+        priority
+      };
 
       batch.push({
         key: log.id,
@@ -171,12 +192,11 @@ async function run() {
       });
 
       console.log(
-        `📤 Sent=${batch.length} | base=${Math.floor(baseRate)} | factor=${externalFactor.toFixed(2)}`
+        `📤 Sent=${batch.length} | factor=${externalFactor.toFixed(2)}`
       );
 
     } catch (err) {
       console.error("🔥 PRODUCER SEND FAILED:", err.message);
-
       await new Promise(res => setTimeout(res, 500));
       continue;
     }

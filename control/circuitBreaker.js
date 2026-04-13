@@ -1,15 +1,21 @@
 const { redisClient } = require('../config/redisClient');
 
 const CIRCUIT_KEY = 'retry_circuit_state';
+const HALF_OPEN_COUNTER_KEY = 'half_open_counter';
 
-const HALF_OPEN_WINDOW_MS = 5000;
-const HALF_OPEN_SAMPLE_RATE = 0.2;
-
+// ----------------------
 const STATES = {
   CLOSED: 'CLOSED',
   OPEN: 'OPEN',
   HALF_OPEN: 'HALF_OPEN',
 };
+
+// ----------------------
+// 🔥 TUNING (IMPORTANT)
+const OPEN_WINDOW_MS = 5000;            // time before HALF_OPEN
+const HALF_OPEN_MAX_ATTEMPTS = 20;      // controlled retry window
+const HALF_OPEN_SUCCESS_THRESHOLD = 0.7;
+const HALF_OPEN_FAILURE_LIMIT = 3;
 
 // ----------------------
 function getDefaultState() {
@@ -38,15 +44,26 @@ async function getCircuitState() {
     };
 
   } catch (err) {
-    console.error("🔥 CIRCUIT STATE READ ERROR:", err.message);
+    console.error("🔥 CB READ ERROR:", err.message);
     return getDefaultState();
   }
 }
 
 // ----------------------
-// 🔥 UPDATED CORE LOGIC
+async function saveState(stateObj) {
+  if (redisClient && redisClient.isOpen) {
+    await redisClient.set(
+      CIRCUIT_KEY,
+      JSON.stringify(stateObj),
+      { EX: 300 }
+    );
+  }
+}
+
 // ----------------------
-async function updateCircuit(metrics) {
+// 🔥 MAIN UPDATE FUNCTION
+// ----------------------
+async function updateCircuit(metrics = {}) {
   try {
     const stateObj = await getCircuitState();
 
@@ -58,68 +75,94 @@ async function updateCircuit(metrics) {
       halfOpenAttempts,
     } = stateObj;
 
+    const now = Date.now();
+
     const failureRate = metrics?.failure_rate || 0;
     const temporary = metrics?.temporary_failure_rate || 0;
     const latency = metrics?.avg_pipeline_latency || 0;
     const retryAmp = metrics?.retry_amplification || 0;
 
-    // ----------------------
-    // 🔴 EARLY OPEN (CRITICAL FIX)
-    // ----------------------
+    // ======================================================
+    // 🔴 HARD OPEN (FAST FAIL)
+    // ======================================================
+    if (temporary > 0.9 || failureRate > 0.9) {
+      if (state !== STATES.OPEN) {
+        state = STATES.OPEN;
+        lastOpenedAt = now;
+
+        halfOpenAttempts = 0;
+        halfOpenSuccess = 0;
+        halfOpenFailure = 0;
+
+        console.log("🚨 CB HARD OPEN (system failing)");
+      }
+    }
+
+    // ======================================================
+    // 🔴 NORMAL OPEN CONDITIONS
+    // ======================================================
     const shouldOpen =
-      temporary > 0.3 ||
-      retryAmp > 2.5 ||
-      failureRate > 0.6 ||
-      latency > 3000;
+      temporary > 0.4 ||
+      retryAmp > 2.0 ||
+      latency > 2000 ||
+      failureRate > 0.6;
 
     // ----------------------
-    // 1. CLOSED → OPEN
+    // CLOSED → OPEN
     // ----------------------
     if (state === STATES.CLOSED) {
       if (shouldOpen) {
         state = STATES.OPEN;
-        lastOpenedAt = Date.now();
+        lastOpenedAt = now;
+
+        halfOpenAttempts = 0;
+        halfOpenSuccess = 0;
+        halfOpenFailure = 0;
 
         console.log(
-          `🚨 CIRCUIT OPEN | temp=${temporary.toFixed(2)} retryAmp=${retryAmp.toFixed(2)} latency=${Math.round(latency)}`
+          `🚨 CB OPEN | temp=${temporary.toFixed(2)} latency=${Math.round(latency)}`
         );
       }
     }
 
     // ----------------------
-    // 2. OPEN → HALF_OPEN
+    // OPEN → HALF_OPEN (RECOVERY WINDOW)
     // ----------------------
     else if (state === STATES.OPEN) {
-      if (Date.now() - lastOpenedAt > HALF_OPEN_WINDOW_MS) {
+      if (now - lastOpenedAt > OPEN_WINDOW_MS) {
         state = STATES.HALF_OPEN;
 
+        halfOpenAttempts = 0;
         halfOpenSuccess = 0;
         halfOpenFailure = 0;
-        halfOpenAttempts = 0;
 
-        console.log("🟡 CIRCUIT HALF-OPEN");
+        if (redisClient?.isOpen) {
+          await redisClient.del(HALF_OPEN_COUNTER_KEY);
+        }
+
+        console.log("🟡 CB HALF-OPEN (testing recovery)");
       }
     }
 
     // ----------------------
-    // 3. HALF_OPEN LOGIC
+    // HALF_OPEN LOGIC
     // ----------------------
     else if (state === STATES.HALF_OPEN) {
 
-      // 🔴 FAST FAIL
-      if (halfOpenFailure > 3) {
+      // 🔴 FAST FAIL BACK TO OPEN
+      if (halfOpenFailure >= HALF_OPEN_FAILURE_LIMIT) {
         state = STATES.OPEN;
-        lastOpenedAt = Date.now();
-
-        console.log("🔴 FAST FAIL → RE-OPEN");
+        lastOpenedAt = now;
 
         halfOpenAttempts = 0;
         halfOpenSuccess = 0;
         halfOpenFailure = 0;
+
+        console.log("🔴 CB RE-OPEN (failures in half-open)");
       }
 
       // 🔥 DECISION WINDOW
-      else if (halfOpenAttempts >= 10) {
+      else if (halfOpenAttempts >= HALF_OPEN_MAX_ATTEMPTS) {
 
         const successRate =
           halfOpenAttempts > 0
@@ -127,21 +170,21 @@ async function updateCircuit(metrics) {
             : 0;
 
         const isHealthy =
-          successRate > 0.8 &&
-          temporary < 0.1 &&
+          successRate > HALF_OPEN_SUCCESS_THRESHOLD &&
+          temporary < 0.2 &&
           retryAmp < 1.5 &&
-          latency < 1500;
+          latency < 1200;
 
         if (isHealthy) {
           state = STATES.CLOSED;
           lastOpenedAt = 0;
 
-          console.log("🟢 CIRCUIT CLOSED (recovered)");
+          console.log("🟢 CB CLOSED (recovered)");
         } else {
           state = STATES.OPEN;
-          lastOpenedAt = Date.now();
+          lastOpenedAt = now;
 
-          console.log("🔴 CIRCUIT RE-OPENED");
+          console.log("🔴 CB RE-OPEN (not stable yet)");
         }
 
         halfOpenAttempts = 0;
@@ -151,43 +194,46 @@ async function updateCircuit(metrics) {
     }
 
     // ----------------------
-    // SAVE STATE
-    // ----------------------
-    if (redisClient && redisClient.isOpen) {
-      await redisClient.set(
-        CIRCUIT_KEY,
-        JSON.stringify({
-          state,
-          lastOpenedAt,
-          halfOpenSuccess,
-          halfOpenFailure,
-          halfOpenAttempts,
-        }),
-        { EX: 300 }
-      );
-    }
+    await saveState({
+      state,
+      lastOpenedAt,
+      halfOpenSuccess,
+      halfOpenFailure,
+      halfOpenAttempts,
+    });
 
     return state;
 
   } catch (err) {
-    console.error("🔥 CIRCUIT UPDATE ERROR:", err.message);
+    console.error("🔥 CB UPDATE ERROR:", err.message);
     return STATES.CLOSED;
   }
 }
 
 // ----------------------
+// 🔥 SHOULD RETRY (CONTROL SIGNAL)
+// ----------------------
 async function shouldRetry() {
-  const { state } = await getCircuitState();
+  const stateObj = await getCircuitState();
 
-  if (state === STATES.OPEN) return false;
+  if (stateObj.state === STATES.OPEN) {
+    return false;
+  }
 
-  if (state === STATES.HALF_OPEN) {
-    return Math.random() < HALF_OPEN_SAMPLE_RATE;
+  if (stateObj.state === STATES.HALF_OPEN) {
+
+    if (!redisClient?.isOpen) return false;
+
+    const count = await redisClient.incr(HALF_OPEN_COUNTER_KEY);
+
+    return count <= HALF_OPEN_MAX_ATTEMPTS;
   }
 
   return true;
 }
 
+// ----------------------
+// 🔥 RECORD RESULT (FOR HALF_OPEN LEARNING)
 // ----------------------
 async function recordHalfOpenResult(success) {
   try {
@@ -200,16 +246,10 @@ async function recordHalfOpenResult(success) {
     if (success) stateObj.halfOpenSuccess += 1;
     else stateObj.halfOpenFailure += 1;
 
-    if (redisClient && redisClient.isOpen) {
-      await redisClient.set(
-        CIRCUIT_KEY,
-        JSON.stringify(stateObj),
-        { EX: 300 }
-      );
-    }
+    await saveState(stateObj);
 
   } catch (err) {
-    console.error("🔥 HALF_OPEN TRACK ERROR:", err.message);
+    console.error("🔥 HALF_OPEN RECORD ERROR:", err.message);
   }
 }
 

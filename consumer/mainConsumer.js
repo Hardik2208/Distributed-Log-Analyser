@@ -1,7 +1,7 @@
 const { Kafka } = require('kafkajs');
 const pLimit = require('p-limit').default;
 
-const { connectRedis } = require('../config/redisClient');
+const { connectRedis, redisClient } = require('../config/redisClient');
 const { processLog } = require('../processing/processLog');
 const { shouldRetry } = require('../control/circuitBreaker');
 
@@ -20,9 +20,22 @@ const consumer = kafka.consumer({
 
 const producer = kafka.producer();
 
-const limit = pLimit(100);
+// ======================================================
+// 🔥 HIGH CONCURRENCY
+// ======================================================
+let concurrency = 100;
+const limit = pLimit(concurrency);
 
-// ----------------------
+// ======================================================
+// 🔥 LOG SAMPLING (IMPORTANT)
+// ======================================================
+const SAMPLE_RATE = 0.01; // 1%
+
+function shouldLog() {
+  return Math.random() < SAMPLE_RATE;
+}
+
+// ======================================================
 async function commitOffset(topic, partition, message) {
   await consumer.commitOffsets([{
     topic,
@@ -31,7 +44,7 @@ async function commitOffset(topic, partition, message) {
   }]);
 }
 
-// ----------------------
+// ======================================================
 async function run() {
   await connectRedis();
   await consumer.connect();
@@ -43,56 +56,137 @@ async function run() {
 
   await consumer.run({
     autoCommit: false,
-    partitionsConsumedConcurrently: 3,
+    partitionsConsumedConcurrently: 10,
 
-    eachMessage: async ({ topic, partition, message }) => {
+    eachMessage: async ({ topic, partition, message, heartbeat }) => {
 
       await limit(async () => {
 
         let log;
 
         try {
+          await heartbeat();
+
           log = JSON.parse(message.value.toString());
 
-          // ----------------------
-          // 🔥 NORMALIZATION
-          // ----------------------
-          log.retry_count = log.retry_count || 0;
-
           const now = Date.now();
+          const priority = log.priority || "LOW";
 
-          // ingestion latency
-          log.ingestion_latency = now - log.timestamp;
-
-          // 🔥 NEW: PIPELINE ENTRY (CRITICAL)
-          if (!log.queue_entered_at) {
-            log.queue_entered_at = log.timestamp;
+          // ======================================================
+          // 🔴 SAMPLE INPUT VISIBILITY
+          // ======================================================
+          if (shouldLog()) {
+            console.log(`📥 IN id=${log.id} p=${priority}`);
           }
 
-          // 🔥 ATTEMPT START (ONLY FOR EXECUTION)
+          // ======================================================
+          // 🔴 SYSTEM STATE (can later cache if needed)
+          // ======================================================
+          const [systemState, circuitState, avgLatency] = await Promise.all([
+            redisClient.get("system:state"),
+            redisClient.get("circuit:state"),
+            redisClient.get("system:avg_latency")
+          ]);
+
+          const latency = Number(avgLatency || 0);
+
+          const isOverloaded =
+            circuitState === "OPEN" ||
+            systemState === "OVERLOADED";
+
+          const isExtreme = latency > 1500;
+
+          // ======================================================
+          // 🔴 LOAD SHEDDING
+          // ======================================================
+          if (isOverloaded) {
+
+            if (priority === "LOW") {
+              if (shouldLog()) {
+                console.log(`🧹 DROP_LOW id=${log.id}`);
+              }
+              await commitOffset(topic, partition, message);
+              return;
+            }
+
+            if (priority === "MEDIUM") {
+              if (Math.random() > 0.2) {
+                if (shouldLog()) {
+                  console.log(`🧹 DROP_MED id=${log.id}`);
+                }
+                await commitOffset(topic, partition, message);
+                return;
+              }
+            }
+
+            if (priority === "HIGH" && isExtreme) {
+              if (Math.random() > 0.2) {
+                if (shouldLog()) {
+                  console.log(`🧹 DROP_HIGH id=${log.id}`);
+                }
+                await commitOffset(topic, partition, message);
+                return;
+              }
+            }
+          }
+
+          // ======================================================
+          // 🔴 NORMALIZATION
+          // ======================================================
+          log.retry_count = log.retry_count || 0;
+
+          log.ingestion_latency = now - log.timestamp;
+          log.queue_entered_at = now;
           log.attempt_timestamp = now;
 
-          // ----------------------
-          // 🔥 PROCESS
-          // ----------------------
+          // ======================================================
+          // 🔥 EXECUTION
+          // ======================================================
           const result = await processLog(log);
 
           if (result?.status === "SUCCESS") {
-            console.log(`✅ SUCCESS ${log.id}`);
-          } 
-          else if (result?.status === "SKIPPED_ALREADY_PROCESSED") {
-            // ignore
+            if (shouldLog()) {
+              console.log(`✅ SUCCESS id=${log.id}`);
+            }
           }
+
           else if (result?.status === "ERROR_CLAIM_FAILED") {
 
             const allowed = await shouldRetry();
 
+            // ======================================================
+            // 🔴 CIRCUIT BREAKER CONTROL
+            // ======================================================
             if (!allowed) {
-              console.log(`⛔ CIRCUIT BLOCKED RETRY ${log.id}`);
-              return;
+
+              if (priority === "LOW") {
+                await commitOffset(topic, partition, message);
+                return;
+              }
+
+              if (priority === "MEDIUM") {
+                if (Math.random() > 0.2) {
+                  await commitOffset(topic, partition, message);
+                  return;
+                }
+              }
+
+              if (priority === "HIGH") {
+                if (Math.random() > 0.5) {
+                  await commitOffset(topic, partition, message);
+                  return;
+                }
+              }
             }
 
+            // ======================================================
+            // 🔥 RETRY SEND
+            // ======================================================
             const retryNow = Date.now();
+
+            if (shouldLog()) {
+              console.log(`📤 RETRY_OUT id=${log.id}`);
+            }
 
             await producer.send({
               topic: 'logs-retry',
@@ -102,23 +196,13 @@ async function run() {
                   ...log,
                   retry_count: 1,
                   retry_id: `${log.id}-r1`,
-                  next_retry_at: retryNow + 500,
-
-                  // 🔥 CRITICAL TIMING
+                  next_retry_at: retryNow + 1000,
                   retry_scheduled_at: retryNow,
-
-                  // 🔥 NEW: RESET PIPELINE ENTRY FOR RETRY
                   queue_entered_at: retryNow,
-
-                  // ❌ DO NOT SET attempt_timestamp HERE
-
-                  source: "CLAIM_FAILED"
+                  source: "MAIN_RETRY"
                 }),
               }],
             });
-          } 
-          else {
-            console.log(`⚠️ UNKNOWN ${log.id}`);
           }
 
         } catch (err) {
@@ -128,26 +212,61 @@ async function run() {
             return;
           }
 
-          // ----------------------
-          // 🔥 TEMPORARY FAILURE
-          // ----------------------
+          const priority = log?.priority || "LOW";
+          const now = Date.now();
+
           if (err.type === "TEMPORARY") {
 
             const currentRetry = log.retry_count || 0;
-            const now = Date.now();
-
             const allowed = await shouldRetry();
 
             if (!allowed) {
-              console.log(`⛔ CIRCUIT BLOCKED RETRY ${log.id}`);
-              return;
+
+              if (priority === "LOW") {
+                await commitOffset(topic, partition, message);
+                return;
+              }
+
+              if (priority === "MEDIUM") {
+                if (Math.random() > 0.2) {
+                  await commitOffset(topic, partition, message);
+                  return;
+                }
+              }
+
+              if (priority === "HIGH") {
+                if (Math.random() > 0.5) {
+                  await commitOffset(topic, partition, message);
+                  return;
+                }
+              }
             }
 
             if (currentRetry >= 1) {
-              console.log(`💀 DLQ ${log.id} retry overflow`);
+
+              if (shouldLog()) {
+                console.log(`💀 DLQ_TEMP id=${log.id}`);
+              }
+
+              await producer.send({
+                topic: 'logs-dlq',
+                messages: [{
+                  value: JSON.stringify({
+                    log,
+                    reason: "MAIN_MAX_RETRY",
+                    failed_at: now
+                  }),
+                }],
+              });
+
             } else {
 
+              const jitter = Math.random() * 300;
               const retryNow = Date.now();
+
+              if (shouldLog()) {
+                console.log(`📤 RETRY_TEMP id=${log.id}`);
+              }
 
               await producer.send({
                 topic: 'logs-retry',
@@ -157,32 +276,37 @@ async function run() {
                     ...log,
                     retry_count: 1,
                     retry_id: `${log.id}-r1`,
-                    next_retry_at: retryNow + 500,
-
-                    // 🔥 CRITICAL TIMING
+                    next_retry_at: retryNow + 1000 + jitter,
                     retry_scheduled_at: retryNow,
-
-                    // 🔥 NEW: RESET PIPELINE ENTRY
                     queue_entered_at: retryNow,
-
-                    // ❌ DO NOT SET attempt_timestamp HERE
-
                     source: "MAIN_RETRY"
                   }),
                 }],
               });
-
-              console.log(`🔁 RETRY ${log.id} r=1`);
             }
 
           } else {
-            console.log(`💀 DLQ ${log.id} permanent`);
+
+            if (shouldLog()) {
+              console.log(`💀 DLQ_PERM id=${log.id}`);
+            }
+
+            await producer.send({
+              topic: 'logs-dlq',
+              messages: [{
+                value: JSON.stringify({
+                  log,
+                  reason: err.type || "PERMANENT",
+                  failed_at: now
+                }),
+              }],
+            });
           }
         }
 
-        // ----------------------
+        // ======================================================
         // 🔥 ALWAYS COMMIT
-        // ----------------------
+        // ======================================================
         await commitOffset(topic, partition, message);
 
       });
