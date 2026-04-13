@@ -1,9 +1,9 @@
 const { Kafka } = require('kafkajs');
 const pLimit = require('p-limit').default;
+
 const { redisClient, connectRedis } = require('../config/redisClient');
 const { processLog } = require('../processing/processLog');
 const { shouldRetry } = require('../control/circuitBreaker');
-const { recordAmplification } = require('../metrics/metricsService');
 
 const kafka = new Kafka({
   clientId: 'retry-consumer',
@@ -104,16 +104,27 @@ async function run() {
         try {
           log = JSON.parse(message.value.toString());
           const executionId = log.retry_id || log.id;
+          const now = Date.now();
 
           // ----------------------
           // ⏳ DELAY HANDLING
           // ----------------------
-          if (log.next_retry_at && Date.now() < log.next_retry_at) {
+          if (log.next_retry_at && now < log.next_retry_at) {
+
             await commitOffset(topic, partition, message);
 
             await producer.send({
               topic: 'logs-retry',
-              messages: [{ key: log.id, value: JSON.stringify(log) }],
+              messages: [{
+                key: log.id,
+                value: JSON.stringify({
+                  ...log,
+                  retry_scheduled_at: now,
+
+                  // 🔥 CRITICAL FIX
+                  queue_entered_at: now
+                })
+              }],
             });
 
             return;
@@ -139,12 +150,12 @@ async function run() {
                 value: JSON.stringify({
                   log,
                   reason: "MAX_RETRY_EXCEEDED",
-                  failed_at: Date.now()
+                  failed_at: now
                 }),
               }],
             });
 
-            console.log(`💀 DLQ ${executionId} max retry`);
+            console.log(`💀 DLQ ${executionId}`);
             await commitOffset(topic, partition, message);
             return;
           }
@@ -152,15 +163,13 @@ async function run() {
           // ----------------------
           // 🔥 BACKPRESSURE
           // ----------------------
-          const isSystemBlocked =
-            cachedState.systemState === "OVERLOADED" ||
-            cachedState.systemState === "PRESSURED" ||
+          const isBlocked =
+            cachedState.systemState !== "HEALTHY" ||
             cachedState.circuitState === "OPEN" ||
             cachedState.avgLatency >= LATENCY_THRESHOLD;
 
-          if (isSystemBlocked && Math.random() < 0.7) {
+          if (isBlocked && Math.random() < 0.7) {
 
-            const nextRetry = log.retry_count + 1;
             const delay = 500 * Math.pow(2, log.retry_count);
 
             await producer.send({
@@ -169,11 +178,13 @@ async function run() {
                 key: log.id,
                 value: JSON.stringify({
                   ...log,
-                  retry_count: nextRetry,
-                  retry_id: `${log.id}-r${nextRetry}`,
-                  next_retry_at: Date.now() + delay,
-                  attempt_timestamp: Date.now(), // 🔥 FIX
-                  source: "SYSTEM_BACKPRESSURE"
+                  next_retry_at: now + delay,
+                  retry_scheduled_at: now,
+
+                  // 🔥 CRITICAL FIX
+                  queue_entered_at: now,
+
+                  source: "BACKPRESSURE_DELAY"
                 }),
               }],
             });
@@ -189,18 +200,18 @@ async function run() {
 
           if (!allowRetry) {
 
-            const nextRetry = log.retry_count + 1;
-
             await producer.send({
               topic: 'logs-retry',
               messages: [{
                 key: log.id,
                 value: JSON.stringify({
                   ...log,
-                  retry_count: nextRetry,
-                  retry_id: `${log.id}-r${nextRetry}`,
-                  next_retry_at: Date.now() + 1000,
-                  attempt_timestamp: Date.now(), // 🔥 FIX
+                  next_retry_at: now + 1000,
+                  retry_scheduled_at: now,
+
+                  // 🔥 CRITICAL FIX
+                  queue_entered_at: now,
+
                   source: "CIRCUIT_DELAY"
                 }),
               }],
@@ -211,16 +222,20 @@ async function run() {
           }
 
           // ----------------------
-          // 🔥 ACTUAL RETRY EXECUTION
+          // 🔥 EXECUTION
           // ----------------------
+          const nextRetry = (log.retry_count || 0) + 1;
 
-          // ✔ count ONLY real retry execution
-          await recordAmplification(true);
+          const executionLog = {
+            ...log,
+            retry_count: nextRetry,
+            retry_id: `${log.id}-r${nextRetry}`,
 
-          // ✔ correct latency tracking
-          log.attempt_timestamp = Date.now();
+            // 🔥 ONLY PLACE WHERE THIS SHOULD EXIST
+            attempt_timestamp: now
+          };
 
-          const result = await processLog(log);
+          const result = await processLog(executionLog);
 
           if (result?.status === "SUCCESS") {
             console.log(`✅ RETRY SUCCESS ${executionId}`);
@@ -236,10 +251,11 @@ async function run() {
           }
 
           const executionId = log.retry_id || log.id;
+          const now = Date.now();
 
           if (err.type === "TEMPORARY") {
 
-            const nextRetry = log.retry_count + 1;
+            const nextRetry = (log.retry_count || 0) + 1;
 
             if (nextRetry > MAX_RETRY) {
 
@@ -248,13 +264,13 @@ async function run() {
                 messages: [{
                   value: JSON.stringify({
                     log,
-                    reason: "TEMPORARY_MAX_RETRY",
-                    failed_at: Date.now()
+                    reason: "TEMP_MAX_RETRY",
+                    failed_at: now
                   }),
                 }],
               });
 
-              console.log(`💀 DLQ ${executionId} temp max retry`);
+              console.log(`💀 DLQ ${executionId}`);
 
             } else {
 
@@ -268,14 +284,18 @@ async function run() {
                     ...log,
                     retry_count: nextRetry,
                     retry_id: `${log.id}-r${nextRetry}`,
-                    next_retry_at: Date.now() + delay,
-                    attempt_timestamp: Date.now(), // 🔥 FIX
+                    next_retry_at: now + delay,
+
+                    // 🔥 CRITICAL FIX
+                    retry_scheduled_at: now,
+                    queue_entered_at: now,
+
                     source: "RETRY_AGAIN"
                   }),
                 }],
               });
 
-              console.log(`🔁 RETRY AGAIN ${executionId} r=${nextRetry}`);
+              console.log(`🔁 RETRY AGAIN ${executionId}`);
             }
 
           } else {
@@ -286,12 +306,12 @@ async function run() {
                 value: JSON.stringify({
                   log,
                   reason: err.type || "PERMANENT",
-                  failed_at: Date.now()
+                  failed_at: now
                 }),
               }],
             });
 
-            console.log(`💀 DLQ ${executionId} permanent`);
+            console.log(`💀 DLQ ${executionId}`);
           }
 
           await commitOffset(topic, partition, message);

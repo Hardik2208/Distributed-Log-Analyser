@@ -1,12 +1,19 @@
 const { redisClient } = require('../config/redisClient');
 
+const TTL = 3600; // 1 hour (optional windowing)
+
 // ----------------------
-// SAFE INCREMENT
+// SAFE OPS
 // ----------------------
 async function safeIncr(key) {
   try {
     if (!redisClient || !redisClient.isOpen) return;
-    await redisClient.incr(key);
+
+    const multi = redisClient.multi();
+    multi.incr(key);
+    multi.expire(key, TTL);
+    await multi.exec();
+
   } catch (err) {
     console.warn(`⚠️ Counter failed [${key}]:`, err.message);
   }
@@ -15,47 +22,86 @@ async function safeIncr(key) {
 async function safeIncrBy(key, amount) {
   try {
     if (!redisClient || !redisClient.isOpen) return;
-    await redisClient.incrBy(key, amount);
+
+    const multi = redisClient.multi();
+    multi.incrBy(key, amount);
+    multi.expire(key, TTL);
+    await multi.exec();
+
   } catch (err) {
     console.warn(`⚠️ IncrBy failed [${key}]:`, err.message);
   }
 }
 
 // ----------------------
+// 🔥 KEY BUILDER (SERVICE AWARE)
+// ----------------------
+function buildKey(service, metric) {
+  return `counter:${service}:${metric}`;
+}
+
+// ----------------------
 // PUBLIC COUNTERS
 // ----------------------
-async function incrementOriginal() {
-  await safeIncr('original_count');
+async function incrementOriginal(service = "order") {
+  await safeIncr(buildKey(service, 'original'));
 }
 
-async function incrementRetry() {
-  await safeIncr('retry_count');
+async function incrementRetry(service = "order") {
+  await safeIncr(buildKey(service, 'retry'));
 }
 
-async function incrementDLQ() {
-  await safeIncr('dlq_count');
+async function incrementDLQ(service = "order") {
+  await safeIncr(buildKey(service, 'dlq'));
 }
 
-// 🔥 CRITICAL FIX (YOU WERE MISSING THIS)
-async function incrementProcessed() {
-  await safeIncr('processed_count');
+async function incrementProcessed(service = "order") {
+  await safeIncr(buildKey(service, 'processed'));
+}
+
+// 🔥 NEW (CRITICAL)
+async function incrementTemporaryFailure(service = "order") {
+  await safeIncr(buildKey(service, 'temporary'));
 }
 
 // ----------------------
-// RESET (for testing)
+// 🔥 BULK (FOR FUTURE USE)
 // ----------------------
-async function resetCounters() {
+async function incrementBatch(service = "order", payload = {}) {
+  try {
+    if (!redisClient || !redisClient.isOpen) return;
+
+    const multi = redisClient.multi();
+
+    for (const [metric, value] of Object.entries(payload)) {
+      multi.incrBy(buildKey(service, metric), value);
+      multi.expire(buildKey(service, metric), TTL);
+    }
+
+    await multi.exec();
+
+  } catch (err) {
+    console.warn('⚠️ Batch counter failed:', err.message);
+  }
+}
+
+// ----------------------
+// RESET (TESTING ONLY)
+// ----------------------
+async function resetCounters(service = "order") {
   try {
     if (!redisClient || !redisClient.isOpen) return;
 
     await redisClient.del(
-      'original_count',
-      'processed_count', // 🔥 added
-      'retry_count',
-      'dlq_count'
+      buildKey(service, 'original'),
+      buildKey(service, 'processed'),
+      buildKey(service, 'retry'),
+      buildKey(service, 'dlq'),
+      buildKey(service, 'temporary')
     );
 
     console.log('✅ Counters reset');
+
   } catch (err) {
     console.warn('⚠️ Counter reset failed:', err.message);
   }
@@ -64,22 +110,26 @@ async function resetCounters() {
 // ----------------------
 // READ
 // ----------------------
-async function getCounters() {
+async function getCounters(service = "order") {
   try {
     if (!redisClient || !redisClient.isOpen) return null;
 
-    const [original, processed, retry, dlq] = await Promise.all([
-      redisClient.get('original_count'),
-      redisClient.get('processed_count'), // 🔥 added
-      redisClient.get('retry_count'),
-      redisClient.get('dlq_count'),
-    ]);
+    const keys = [
+      buildKey(service, 'original'),
+      buildKey(service, 'processed'),
+      buildKey(service, 'retry'),
+      buildKey(service, 'dlq'),
+      buildKey(service, 'temporary')
+    ];
+
+    const values = await Promise.all(keys.map(k => redisClient.get(k)));
 
     return {
-      original: parseInt(original || '0'),
-      processed: parseInt(processed || '0'), // 🔥 added
-      retry: parseInt(retry || '0'),
-      dlq: parseInt(dlq || '0'),
+      original: parseInt(values[0] || '0'),
+      processed: parseInt(values[1] || '0'),
+      retry: parseInt(values[2] || '0'),
+      dlq: parseInt(values[3] || '0'),
+      temporary: parseInt(values[4] || '0'),
     };
 
   } catch (err) {
@@ -93,7 +143,9 @@ module.exports = {
   incrementOriginal,
   incrementRetry,
   incrementDLQ,
-  incrementProcessed, // 🔥 exported
+  incrementProcessed,
+  incrementTemporaryFailure, // 🔥 new
+  incrementBatch,
   resetCounters,
   getCounters,
 };

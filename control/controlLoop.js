@@ -15,25 +15,41 @@ let latencyHistory = [];
 const MAX_HISTORY = 5;
 
 // ----------------------
-// 🔥 METRICS FETCH (FIXED)
+// 🔥 METRICS FETCH (FIXED + ALIGNED)
 // ----------------------
 async function getLatestMetrics(service) {
   const windows = await redisClient.sMembers(`metrics:windows:${service}`);
   if (!windows.length) return null;
 
   const sorted = windows.map(Number).sort((a, b) => b - a);
-  const recent = sorted.slice(0, 3); // last 3 windows
+  const recent = sorted.slice(0, 3);
 
-  let total = 0, failure = 0, latency = 0, pipelineLatency = 0, retry = 0, original = 0;
+  let total = 0;
+  let success = 0;
+  let failure = 0;
+  let temporary = 0;
+
+  let latencySum = 0;
+  let pipelineSum = 0;
+  let endToEndSum = 0;
+
+  let retry = 0;
+  let original = 0;
 
   for (const w of recent) {
     const data = await redisClient.hGetAll(`${service}:${w}`);
-    if (!data) continue;
+    if (!data || Object.keys(data).length === 0) continue;
 
-    total += Number(data.count || 0);
+    total += Number(data.total || 0);
+
+    success += Number(data.success || 0);
     failure += Number(data.failure || 0);
-    latency += Number(data.latency || 0);
-    pipelineLatency += Number(data.pipelineLatency || 0);
+    temporary += Number(data.temporary || 0);
+
+    latencySum += Number(data.latencySum || 0);
+    pipelineSum += Number(data.pipelineLatencySum || 0);
+    endToEndSum += Number(data.endToEndLatencySum || 0);
+
     retry += Number(data.retry || 0);
     original += Number(data.original || 0);
   }
@@ -43,7 +59,7 @@ async function getLatestMetrics(service) {
   // ----------------------
   // 🔥 SMOOTH LATENCY
   // ----------------------
-  const currentLatency = pipelineLatency / total;
+  const currentLatency = pipelineSum / total;
 
   latencyHistory.push(currentLatency);
   if (latencyHistory.length > MAX_HISTORY) latencyHistory.shift();
@@ -53,10 +69,17 @@ async function getLatestMetrics(service) {
 
   return {
     total_attempts: total,
+
+    success_rate: success / total,
     failure_rate: failure / total,
-    avg_latency: latency / total,
+    temporary_failure_rate: temporary / total,
+
+    avg_latency: latencySum / total,
     avg_pipeline_latency: smoothedLatency,
-    retry_amplification: original === 0 ? 0 : (original + retry) / original
+    avg_end_to_end_latency: endToEndSum / total,
+
+    retry_amplification:
+      original === 0 ? 0 : total / original
   };
 }
 
@@ -92,7 +115,7 @@ async function startControlLoop(service = "order") {
       }
 
       // ----------------------
-      // 🔥 3. STORE GLOBAL STATE (ONLY IF CHANGED)
+      // 🔥 3. STORE GLOBAL STATE
       // ----------------------
       if (prevStoredState !== currentState) {
         await redisClient.set("system:state", currentState);
@@ -110,7 +133,7 @@ async function startControlLoop(service = "order") {
       }
 
       // ----------------------
-      // 🔥 4. BACKPRESSURE ACTIONS
+      // 🔥 4. BACKPRESSURE
       // ----------------------
       await applyBackpressure(currentState, metrics);
 
@@ -133,11 +156,12 @@ async function startControlLoop(service = "order") {
       });
 
       // ----------------------
-      // 🔥 DEBUG (MEANINGFUL)
+      // 🔥 DEBUG (UPGRADED)
       // ----------------------
       console.log("📊", {
         state: currentState,
         circuit: circuitState,
+        tempFail: metrics.temporary_failure_rate.toFixed(2),
         failure: metrics.failure_rate.toFixed(2),
         latency: Math.round(metrics.avg_pipeline_latency),
         retryAmp: metrics.retry_amplification.toFixed(2)

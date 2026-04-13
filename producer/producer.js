@@ -12,11 +12,11 @@ const controlConsumer = kafka.consumer({ groupId: 'producer-control' });
 // --------------------------------
 // CONTROL STATE
 // --------------------------------
-let baseRate = 500;
+let baseRate = 10000;
 let externalFactor = 1.0;
 
-const MIN_RATE = 500;
-const MAX_RATE = 500;
+const MIN_RATE = 10000;
+const MAX_RATE = 10000;
 
 // --------------------------------
 // SERVICE CONFIG

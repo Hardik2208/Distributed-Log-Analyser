@@ -12,8 +12,6 @@ const STATES = {
 };
 
 // ----------------------
-// DEFAULT STATE
-// ----------------------
 function getDefaultState() {
   return {
     state: STATES.CLOSED,
@@ -24,8 +22,6 @@ function getDefaultState() {
   };
 }
 
-// ----------------------
-// GET STATE
 // ----------------------
 async function getCircuitState() {
   try {
@@ -48,7 +44,7 @@ async function getCircuitState() {
 }
 
 // ----------------------
-// UPDATE CIRCUIT (CORE)
+// 🔥 UPDATED CORE LOGIC
 // ----------------------
 async function updateCircuit(metrics) {
   try {
@@ -63,12 +59,37 @@ async function updateCircuit(metrics) {
     } = stateObj;
 
     const failureRate = metrics?.failure_rate || 0;
+    const temporary = metrics?.temporary_failure_rate || 0;
     const latency = metrics?.avg_pipeline_latency || 0;
+    const retryAmp = metrics?.retry_amplification || 0;
 
     // ----------------------
-    // 1. OPEN → HALF_OPEN
+    // 🔴 EARLY OPEN (CRITICAL FIX)
     // ----------------------
-    if (state === STATES.OPEN) {
+    const shouldOpen =
+      temporary > 0.3 ||
+      retryAmp > 2.5 ||
+      failureRate > 0.6 ||
+      latency > 3000;
+
+    // ----------------------
+    // 1. CLOSED → OPEN
+    // ----------------------
+    if (state === STATES.CLOSED) {
+      if (shouldOpen) {
+        state = STATES.OPEN;
+        lastOpenedAt = Date.now();
+
+        console.log(
+          `🚨 CIRCUIT OPEN | temp=${temporary.toFixed(2)} retryAmp=${retryAmp.toFixed(2)} latency=${Math.round(latency)}`
+        );
+      }
+    }
+
+    // ----------------------
+    // 2. OPEN → HALF_OPEN
+    // ----------------------
+    else if (state === STATES.OPEN) {
       if (Date.now() - lastOpenedAt > HALF_OPEN_WINDOW_MS) {
         state = STATES.HALF_OPEN;
 
@@ -81,22 +102,37 @@ async function updateCircuit(metrics) {
     }
 
     // ----------------------
-    // 2. HALF_OPEN → CLOSED / OPEN
+    // 3. HALF_OPEN LOGIC
     // ----------------------
     else if (state === STATES.HALF_OPEN) {
 
-      if (halfOpenAttempts >= 10) {
+      // 🔴 FAST FAIL
+      if (halfOpenFailure > 3) {
+        state = STATES.OPEN;
+        lastOpenedAt = Date.now();
+
+        console.log("🔴 FAST FAIL → RE-OPEN");
+
+        halfOpenAttempts = 0;
+        halfOpenSuccess = 0;
+        halfOpenFailure = 0;
+      }
+
+      // 🔥 DECISION WINDOW
+      else if (halfOpenAttempts >= 10) {
 
         const successRate =
           halfOpenAttempts > 0
             ? halfOpenSuccess / halfOpenAttempts
             : 0;
 
-        if (
+        const isHealthy =
           successRate > 0.8 &&
-          failureRate < 0.3 &&
-          latency < 1500
-        ) {
+          temporary < 0.1 &&
+          retryAmp < 1.5 &&
+          latency < 1500;
+
+        if (isHealthy) {
           state = STATES.CLOSED;
           lastOpenedAt = 0;
 
@@ -108,32 +144,9 @@ async function updateCircuit(metrics) {
           console.log("🔴 CIRCUIT RE-OPENED");
         }
 
+        halfOpenAttempts = 0;
         halfOpenSuccess = 0;
         halfOpenFailure = 0;
-        halfOpenAttempts = 0;
-      }
-    }
-    if (halfOpenFailure > 5) {
-  state = STATES.OPEN;
-  lastOpenedAt = Date.now();
-
-  console.log("🔴 FAST FAIL → RE-OPEN");
-
-  halfOpenAttempts = 0;
-  halfOpenSuccess = 0;
-  halfOpenFailure = 0;
-}
-    // ----------------------
-    // 3. CLOSED → OPEN
-    // ----------------------
-    else if (state === STATES.CLOSED) {
-      if (failureRate > 0.6 || latency > 3000) {
-        state = STATES.OPEN;
-        lastOpenedAt = Date.now();
-
-        console.log(
-          `🚨 CIRCUIT OPEN | failure=${failureRate.toFixed(2)} latency=${Math.round(latency)}ms`
-        );
       }
     }
 
@@ -163,8 +176,6 @@ async function updateCircuit(metrics) {
 }
 
 // ----------------------
-// SHOULD RETRY
-// ----------------------
 async function shouldRetry() {
   const { state } = await getCircuitState();
 
@@ -177,8 +188,6 @@ async function shouldRetry() {
   return true;
 }
 
-// ----------------------
-// RECORD HALF_OPEN RESULT
 // ----------------------
 async function recordHalfOpenResult(success) {
   try {

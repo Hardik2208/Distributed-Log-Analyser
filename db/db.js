@@ -12,7 +12,7 @@ const pool = mysql.createPool({
 });
 
 // 🔥 CONTROL LIMITS
-const MAX_BATCH_SIZE = 500;   // prevent huge locks
+const MAX_BATCH_SIZE = 500;
 const DB_TIMEOUT_MS = 2000;
 
 // ----------------------
@@ -25,28 +25,46 @@ async function insertMetric(record) {
     INSERT INTO metrics_window (
       service,
       window_start,
-      request_count,
-      error_count,
-      error_rate,
+
+      total_attempts,
+      success_count,
+      failure_count,
+      temporary_failure_count,
+
+      original_count,
+      retry_count,
+
+      retry_amplification,
+      avg_retry_depth,
+      max_retry_depth,
+
       avg_latency,
       avg_pipeline_latency,
-      avg_ingestion_latency,
-      retry_amplification,
-      avg_retry_depth
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      avg_end_to_end_latency,
+      avg_ingestion_latency
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `;
 
   const values = [
     record.service,
     record.window_start,
-    record.request_count,
-    record.error_count,
-    record.error_rate,
+
+    record.total_attempts,
+    record.success_count,
+    record.failure_count,
+    record.temporary_failure_count,
+
+    record.original_count,
+    record.retry_count,
+
+    record.retry_amplification,
+    record.avg_retry_depth,
+    record.max_retry_depth,
+
     record.avg_latency,
     record.avg_pipeline_latency,
-    record.avg_ingestion_latency,
-    record.retry_amplification,
-    record.avg_retry_depth
+    record.avg_end_to_end_latency,
+    record.avg_ingestion_latency
   ];
 
   try {
@@ -68,7 +86,6 @@ async function bulkInsertMetrics(records) {
 
   const start = Date.now();
 
-  // 🔥 LIMIT BATCH SIZE (NO LOGIC LOSS)
   const safeRecords = records.slice(0, MAX_BATCH_SIZE);
   const batchSize = safeRecords.length;
 
@@ -77,38 +94,54 @@ async function bulkInsertMetrics(records) {
   try {
     console.log(`🧱 DB BATCH START | size=${batchSize}`);
 
-    // 🔴 KEEP TRANSACTION (AS PER YOUR DESIGN)
     await connection.beginTransaction();
 
     const query = `
       INSERT INTO metrics_window (
         service,
         window_start,
-        request_count,
-        error_count,
-        error_rate,
+
+        total_attempts,
+        success_count,
+        failure_count,
+        temporary_failure_count,
+
+        original_count,
+        retry_count,
+
+        retry_amplification,
+        avg_retry_depth,
+        max_retry_depth,
+
         avg_latency,
         avg_pipeline_latency,
-        avg_ingestion_latency,
-        retry_amplification,
-        avg_retry_depth
+        avg_end_to_end_latency,
+        avg_ingestion_latency
       ) VALUES ?
     `;
 
     const values = safeRecords.map(r => [
       r.service,
       r.window_start,
-      r.request_count,
-      r.error_count,
-      r.error_rate,
+
+      r.total_attempts,
+      r.success_count,
+      r.failure_count,
+      r.temporary_failure_count,
+
+      r.original_count,
+      r.retry_count,
+
+      r.retry_amplification,
+      r.avg_retry_depth,
+      r.max_retry_depth,
+
       r.avg_latency,
       r.avg_pipeline_latency,
-      r.avg_ingestion_latency,
-      r.retry_amplification,
-      r.avg_retry_depth
+      r.avg_end_to_end_latency,
+      r.avg_ingestion_latency
     ]);
 
-    // 🔥 TIMEOUT PROTECTION (ADDED, NO LOGIC LOSS)
     const timeout = new Promise((_, reject) =>
       setTimeout(() => reject(new Error("DB_TIMEOUT")), DB_TIMEOUT_MS)
     );
@@ -166,9 +199,7 @@ async function bulkInsertWithRetry(records, retries = 3) {
         throw err;
       }
 
-      // 🔥 IMPROVED BACKOFF WITH JITTER (NO LOGIC LOSS)
       const delay = (50 * (i + 1)) + Math.random() * 50;
-
       await new Promise(res => setTimeout(res, delay));
     }
   }

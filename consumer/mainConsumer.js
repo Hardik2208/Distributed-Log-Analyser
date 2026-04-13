@@ -1,8 +1,9 @@
 const { Kafka } = require('kafkajs');
 const pLimit = require('p-limit').default;
-const { recordAmplification } = require('../metrics/metricsService');
+
 const { connectRedis } = require('../config/redisClient');
 const { processLog } = require('../processing/processLog');
+const { shouldRetry } = require('../control/circuitBreaker');
 
 const kafka = new Kafka({
   clientId: 'main-consumer',
@@ -19,7 +20,6 @@ const consumer = kafka.consumer({
 
 const producer = kafka.producer();
 
-// 🔥 CONCURRENCY
 const limit = pLimit(100);
 
 // ----------------------
@@ -55,18 +55,22 @@ async function run() {
           log = JSON.parse(message.value.toString());
 
           // ----------------------
-          // 🔥 ATTEMPT TRACKING (ORIGINAL)
-          // ----------------------
-          await recordAmplification(false);
-
-          // ----------------------
           // 🔥 NORMALIZATION
           // ----------------------
           log.retry_count = log.retry_count || 0;
-          log.ingestion_latency = Date.now() - log.timestamp;
 
-          // 🔥 FIX: ATTEMPT TIMESTAMP (CRITICAL)
-          log.attempt_timestamp = log.timestamp;
+          const now = Date.now();
+
+          // ingestion latency
+          log.ingestion_latency = now - log.timestamp;
+
+          // 🔥 NEW: PIPELINE ENTRY (CRITICAL)
+          if (!log.queue_entered_at) {
+            log.queue_entered_at = log.timestamp;
+          }
+
+          // 🔥 ATTEMPT START (ONLY FOR EXECUTION)
+          log.attempt_timestamp = now;
 
           // ----------------------
           // 🔥 PROCESS
@@ -77,13 +81,19 @@ async function run() {
             console.log(`✅ SUCCESS ${log.id}`);
           } 
           else if (result?.status === "SKIPPED_ALREADY_PROCESSED") {
-            // duplicate — ignore
+            // ignore
           }
           else if (result?.status === "ERROR_CLAIM_FAILED") {
 
-            // ----------------------
-            // 🔥 SAFE RETRY (CLAIM FAILURE)
-            // ----------------------
+            const allowed = await shouldRetry();
+
+            if (!allowed) {
+              console.log(`⛔ CIRCUIT BLOCKED RETRY ${log.id}`);
+              return;
+            }
+
+            const retryNow = Date.now();
+
             await producer.send({
               topic: 'logs-retry',
               messages: [{
@@ -92,13 +102,20 @@ async function run() {
                   ...log,
                   retry_count: 1,
                   retry_id: `${log.id}-r1`,
-                  next_retry_at: Date.now() + 500,
-                  attempt_timestamp: Date.now(), // 🔥 important
+                  next_retry_at: retryNow + 500,
+
+                  // 🔥 CRITICAL TIMING
+                  retry_scheduled_at: retryNow,
+
+                  // 🔥 NEW: RESET PIPELINE ENTRY FOR RETRY
+                  queue_entered_at: retryNow,
+
+                  // ❌ DO NOT SET attempt_timestamp HERE
+
                   source: "CLAIM_FAILED"
                 }),
               }],
             });
-
           } 
           else {
             console.log(`⚠️ UNKNOWN ${log.id}`);
@@ -112,16 +129,25 @@ async function run() {
           }
 
           // ----------------------
-          // 🔥 RETRY HANDLING
+          // 🔥 TEMPORARY FAILURE
           // ----------------------
           if (err.type === "TEMPORARY") {
 
             const currentRetry = log.retry_count || 0;
+            const now = Date.now();
+
+            const allowed = await shouldRetry();
+
+            if (!allowed) {
+              console.log(`⛔ CIRCUIT BLOCKED RETRY ${log.id}`);
+              return;
+            }
 
             if (currentRetry >= 1) {
               console.log(`💀 DLQ ${log.id} retry overflow`);
-              // retry consumer will take final decision
             } else {
+
+              const retryNow = Date.now();
 
               await producer.send({
                 topic: 'logs-retry',
@@ -131,8 +157,16 @@ async function run() {
                     ...log,
                     retry_count: 1,
                     retry_id: `${log.id}-r1`,
-                    next_retry_at: Date.now() + 500,
-                    attempt_timestamp: Date.now(), // 🔥 important
+                    next_retry_at: retryNow + 500,
+
+                    // 🔥 CRITICAL TIMING
+                    retry_scheduled_at: retryNow,
+
+                    // 🔥 NEW: RESET PIPELINE ENTRY
+                    queue_entered_at: retryNow,
+
+                    // ❌ DO NOT SET attempt_timestamp HERE
+
                     source: "MAIN_RETRY"
                   }),
                 }],
@@ -142,13 +176,12 @@ async function run() {
             }
 
           } else {
-            // permanent → processLog already emitted final metric
             console.log(`💀 DLQ ${log.id} permanent`);
           }
         }
 
         // ----------------------
-        // 🔥 ALWAYS COMMIT OFFSET
+        // 🔥 ALWAYS COMMIT
         // ----------------------
         await commitOffset(topic, partition, message);
 

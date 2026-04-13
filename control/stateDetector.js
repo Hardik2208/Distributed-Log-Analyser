@@ -6,29 +6,37 @@ function getSystemState(metrics, currentState) {
   const latency = metrics.avg_pipeline_latency || 0;
   const retryAmp = metrics.retry_amplification || 0;
   const failure = metrics.failure_rate || 0;
+  const temporary = metrics.temporary_failure_rate || 0;
+
+  // ----------------------
+  // 🔥 PRIORITY SIGNALS (CRITICAL)
+  // ----------------------
+
+  const isOverloaded =
+    temporary > THRESHOLDS.OVERLOAD.temporary ||
+    retryAmp > THRESHOLDS.OVERLOAD.retryAmp ||
+    latency > THRESHOLDS.OVERLOAD.latency ||
+    failure > THRESHOLDS.OVERLOAD.failure;
+
+  const isPressured =
+    temporary > THRESHOLDS.ENABLE.temporary ||
+    retryAmp > THRESHOLDS.ENABLE.retryAmp ||
+    latency > THRESHOLDS.ENABLE.latency ||
+    failure > THRESHOLDS.ENABLE.failure;
+
+  const isRecovered =
+    temporary < THRESHOLDS.RECOVERY.temporary &&
+    retryAmp < THRESHOLDS.RECOVERY.retryAmp &&
+    latency < THRESHOLDS.RECOVERY.latency &&
+    failure < THRESHOLDS.RECOVERY.failure;
 
   // ----------------------
   // 🔥 FROM HEALTHY
   // ----------------------
   if (currentState === "HEALTHY") {
 
-    // 🔴 Direct jump to OVERLOADED
-    if (
-      latency > THRESHOLDS.OVERLOAD.latency ||
-      retryAmp > THRESHOLDS.OVERLOAD.retryAmp ||
-      failure > THRESHOLDS.OVERLOAD.failure
-    ) {
-      return "OVERLOADED";
-    }
-
-    // 🟡 Move to PRESSURED
-    if (
-      latency > THRESHOLDS.ENABLE.latency ||
-      retryAmp > THRESHOLDS.ENABLE.retryAmp ||
-      failure > THRESHOLDS.ENABLE.failure
-    ) {
-      return "PRESSURED";
-    }
+    if (isOverloaded) return "OVERLOADED";
+    if (isPressured) return "PRESSURED";
 
     return "HEALTHY";
   }
@@ -38,23 +46,8 @@ function getSystemState(metrics, currentState) {
   // ----------------------
   if (currentState === "PRESSURED") {
 
-    // 🔴 Escalate
-    if (
-      latency > THRESHOLDS.OVERLOAD.latency ||
-      retryAmp > THRESHOLDS.OVERLOAD.retryAmp ||
-      failure > THRESHOLDS.OVERLOAD.failure
-    ) {
-      return "OVERLOADED";
-    }
-
-    // 🟢 Recover (lower thresholds → hysteresis)
-    if (
-      latency < THRESHOLDS.RECOVERY.latency &&
-      retryAmp < THRESHOLDS.RECOVERY.retryAmp &&
-      failure < THRESHOLDS.RECOVERY.failure
-    ) {
-      return "HEALTHY";
-    }
+    if (isOverloaded) return "OVERLOADED";
+    if (isRecovered) return "HEALTHY";
 
     return "PRESSURED";
   }
@@ -64,10 +57,11 @@ function getSystemState(metrics, currentState) {
   // ----------------------
   if (currentState === "OVERLOADED") {
 
-    // 🟡 Step down (NOT directly to HEALTHY)
+    // step-down logic (no direct jump to healthy)
     if (
-      latency < THRESHOLDS.ENABLE.latency &&
+      temporary < THRESHOLDS.ENABLE.temporary &&
       retryAmp < THRESHOLDS.ENABLE.retryAmp &&
+      latency < THRESHOLDS.ENABLE.latency &&
       failure < THRESHOLDS.ENABLE.failure
     ) {
       return "PRESSURED";
@@ -76,8 +70,6 @@ function getSystemState(metrics, currentState) {
     return "OVERLOADED";
   }
 
-  // ----------------------
-  // 🔥 DEFAULT SAFE STATE
   // ----------------------
   return "HEALTHY";
 }

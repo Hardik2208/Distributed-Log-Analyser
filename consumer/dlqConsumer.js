@@ -1,8 +1,8 @@
 const { Kafka } = require('kafkajs');
 const pLimit = require('p-limit').default;
 
-const { connectRedis } = require('../config/redisClient');
-const { addToDLQ, isDuplicate } = require('../metrics/redisMetrics');
+const { connectRedis, redisClient } = require('../config/redisClient');
+const { addToDLQ } = require('../metrics/dlqService'); // ✅ FIXED
 
 const kafka = new Kafka({
   clientId: 'dlq-consumer',
@@ -11,8 +11,16 @@ const kafka = new Kafka({
 
 const consumer = kafka.consumer({ groupId: 'log-group-dlq' });
 
-// 🔥 CONTROLLED CONCURRENCY
 const limit = pLimit(20);
+
+// ----------------------
+async function commitOffset(topic, partition, message) {
+  await consumer.commitOffsets([{
+    topic,
+    partition,
+    offset: (Number(message.offset) + 1).toString(),
+  }]);
+}
 
 // ----------------------
 async function run() {
@@ -25,49 +33,62 @@ async function run() {
 
   await consumer.run({
     autoCommit: false,
-    partitionsConsumedConcurrently: 1,
 
     eachMessage: async ({ topic, partition, message }) => {
 
-  limit(async () => {
+      await limit(async () => {
 
-    try {
+        let payload;
 
-      let payload;
+        try {
+          payload = JSON.parse(message.value.toString());
+        } catch {
+          console.log('❌ DLQ PARSE ERROR');
+          await commitOffset(topic, partition, message);
+          return;
+        }
 
-      try {
-        payload = JSON.parse(message.value.toString());
-      } catch {
-        console.log('❌ DLQ PARSE ERROR');
-        return;
-      }
+        const log = payload.log || payload;
+        const reason = payload.reason || 'UNKNOWN';
 
-      const log = payload.log || payload;
-      const reason = payload.reason || 'UNKNOWN';
+        if (!log?.id) {
+          await commitOffset(topic, partition, message);
+          return;
+        }
 
-      if (!log?.id) return;
+        // 🔥 IDEMPOTENCY (STRONG)
+        const claimed = await redisClient.set(
+          `dlq:processed:${log.id}`,
+          "1",
+          { NX: true, EX: 86400 }
+        );
 
-      const duplicate = await isDuplicate(`dlq:${log.id}`);
-      if (duplicate) return;
+        if (!claimed) {
+          await commitOffset(topic, partition, message);
+          return;
+        }
 
-      await addToDLQ(log, reason);
+        try {
+          await addToDLQ(log, {
+            reason,
+            source: payload.source || "DLQ_CONSUMER"
+          });
 
-      console.log(`💀 DLQ STORED ${log.id} | ${reason}`);
+          console.log(`💀 DLQ STORED ${log.id}`);
 
-      await consumer.commitOffsets([{
-        topic,
-        partition,
-        offset: (Number(message.offset) + 1).toString(),
-      }]);
+          await commitOffset(topic, partition, message);
 
-    } catch (err) {
-      console.error("🔥 DLQ PROCESSING ERROR:", err.message);
-      // DO NOT CRASH — just log
-    }
+        } catch (err) {
 
-  });
+          console.error("🔥 DLQ PROCESSING ERROR:");
+          console.error("➡️ ERROR:", err.message);
 
-}
+          // 🔴 DO NOT COMMIT → Kafka retry
+        }
+
+      });
+
+    },
   });
 }
 

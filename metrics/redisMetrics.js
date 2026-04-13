@@ -1,55 +1,73 @@
 const { redisClient } = require('../config/redisClient');
 
 // ----------------------
-// UPDATE METRICS (UNIFIED + PRODUCTION SAFE)
+// 🔥 UPDATE METRICS (FINAL MODEL)
 // ----------------------
 async function updateMetrics({
   service,
   window,
+
   isRetry,
   isFirstAttempt,
   retryCount,
-  failed,
+
   success,
+  failed,
+  isTemporaryFailure,
+
   latency,
   pipelineLatency,
-  ingestionLatency
+  endToEndLatency,
+  ingestionLatency,
+
+  // 🔥 NEW SIGNALS
+  retryDelay,
+  queueDelay,
+  processingTime
 }) {
   try {
     const key = `${service}:${window}`;
-
     const multi = redisClient.multi();
 
-    // 🔥 TRACK WINDOW
     multi.sAdd(`metrics:windows:${service}`, String(window));
 
     // ----------------------
     // COUNTS
     // ----------------------
-    multi.hIncrBy(key, 'count', 1);
+    multi.hIncrBy(key, 'total', 1);
 
     if (success) multi.hIncrBy(key, 'success', 1);
     if (failed) multi.hIncrBy(key, 'failure', 1);
+    if (isTemporaryFailure) multi.hIncrBy(key, 'temporary', 1);
 
     // ----------------------
-    // RETRY TRACKING
+    // ATTEMPT TYPE
     // ----------------------
     if (isFirstAttempt) multi.hIncrBy(key, 'original', 1);
-    if (isRetry) {
-      multi.hIncrBy(key, 'retry', 1);
-      multi.hIncrBy(key, 'retryDepth', retryCount || 0);
+    if (isRetry) multi.hIncrBy(key, 'retry', 1);
+
+    // ----------------------
+    // RETRY DEPTH
+    // ----------------------
+    if (retryCount > 0) {
+      multi.hIncrBy(key, 'retryDepthSum', retryCount);
     }
 
     // ----------------------
     // LATENCIES
     // ----------------------
-    multi.hIncrByFloat(key, 'latency', latency || 0);
-    multi.hIncrByFloat(key, 'pipelineLatency', pipelineLatency || 0);
-    multi.hIncrByFloat(key, 'ingestionLatency', ingestionLatency || 0);
+    multi.hIncrByFloat(key, 'latencySum', latency || 0);
+    multi.hIncrByFloat(key, 'pipelineLatencySum', pipelineLatency || 0);
+    multi.hIncrByFloat(key, 'endToEndLatencySum', endToEndLatency || 0);
+    multi.hIncrByFloat(key, 'ingestionLatencySum', ingestionLatency || 0);
 
     // ----------------------
-    // TTL (avoid memory leak)
+    // 🔥 NEW SIGNALS
     // ----------------------
+    multi.hIncrByFloat(key, 'retryDelaySum', retryDelay || 0);
+    multi.hIncrByFloat(key, 'queueDelaySum', queueDelay || 0);
+    multi.hIncrByFloat(key, 'processingTimeSum', processingTime || 0);
+
     multi.expire(key, 3600);
 
     await multi.exec();
@@ -60,126 +78,7 @@ async function updateMetrics({
 }
 
 // ----------------------
-// DUPLICATE CHECK
-// ----------------------
-async function isDuplicate(id) {
-  try {
-    return await redisClient.exists(`processed:${id}`);
-  } catch (err) {
-    throw { type: 'REDIS_ERROR', message: err.message };
-  }
-}
-
-// ----------------------
-// MARK PROCESSED
-// ----------------------
-async function markProcessed(id) {
-  try {
-    await redisClient.set(`processed:${id}`, 1, { EX: 3600 });
-  } catch (err) {
-    throw { type: 'REDIS_ERROR', message: err.message };
-  }
-}
-
-// ----------------------
-// GENERIC SET ADD
-// ----------------------
-async function addToSet(key, value) {
-  try {
-    await redisClient.sAdd(key, value);
-  } catch (err) {
-    throw { type: 'REDIS_ERROR', message: err.message };
-  }
-}
-
-// ----------------------
-// DLQ STORAGE
-// ----------------------
-async function addToDLQ(log, reason) {
-  try {
-    const entry = {
-      id: log.id,
-      service: log.service,
-      reason,
-      retry_count: log.retry_count || 0,
-      retry_history: log.retry_history || [],
-      pipeline_latency: log.pipeline_latency || 0,
-      ingestion_latency: log.ingestion_latency || 0,
-      original_timestamp: log.timestamp,
-      failed_at: Date.now(),
-      total_time_in_pipeline: Date.now() - log.timestamp,
-    };
-
-    const dlqKey = `dlq:entry:${log.id}`;
-
-    await redisClient.hSet(dlqKey, {
-      id: entry.id,
-      service: entry.service || '',
-      reason: entry.reason || '',
-      retry_count: String(entry.retry_count),
-      pipeline_latency: String(entry.pipeline_latency),
-      total_time_in_pipeline: String(entry.total_time_in_pipeline),
-      failed_at: String(entry.failed_at),
-      retry_history: JSON.stringify(entry.retry_history),
-    });
-
-    await redisClient.expire(dlqKey, 86400);
-    await redisClient.sAdd('dlq_ids', log.id);
-
-  } catch (err) {
-    throw { type: 'REDIS_ERROR', message: err.message };
-  }
-}
-
-// ----------------------
-// DLQ ANALYTICS
-// ----------------------
-async function getDLQStats() {
-  const ids = await redisClient.sMembers('dlq_ids');
-  if (!ids.length) return { count: 0, entries: [] };
-
-  const entries = [];
-
-  for (const id of ids.slice(-50)) {
-    try {
-      const data = await redisClient.hGetAll(`dlq:entry:${id}`);
-
-      if (data && data.id) {
-        entries.push({
-          ...data,
-          retry_count: parseInt(data.retry_count || 0),
-          pipeline_latency: parseInt(data.pipeline_latency || 0),
-          total_time_in_pipeline: parseInt(data.total_time_in_pipeline || 0),
-          retry_history: JSON.parse(data.retry_history || '[]'),
-        });
-      }
-    } catch {}
-  }
-
-  const avgRetries = entries.length
-    ? entries.reduce((s, e) => s + e.retry_count, 0) / entries.length
-    : 0;
-
-  const avgTime = entries.length
-    ? entries.reduce((s, e) => s + e.total_time_in_pipeline, 0) / entries.length
-    : 0;
-
-  const byReason = entries.reduce((acc, e) => {
-    acc[e.reason] = (acc[e.reason] || 0) + 1;
-    return acc;
-  }, {});
-
-  return {
-    count: ids.length,
-    avg_retries_before_dlq: parseFloat(avgRetries.toFixed(2)),
-    avg_time_in_pipeline_ms: Math.round(avgTime),
-    by_reason: byReason,
-    recent: entries.slice(-10),
-  };
-}
-
-// ----------------------
-// METRICS FETCH (ALIGNED WITH BUFFER)
+// 🔥 FETCH METRICS (UPDATED)
 // ----------------------
 async function getMetrics(service, window) {
   const key = `${service}:${window}`;
@@ -187,44 +86,109 @@ async function getMetrics(service, window) {
 
   if (!data || Object.keys(data).length === 0) return null;
 
-  const count = +data.count || 0;
-  const success = +data.success || 0;
-  const failure = +data.failure || 0;
+  const total = +data.total || 0;
+
+  if (total === 0) return null;
+
   const original = +data.original || 0;
   const retry = +data.retry || 0;
-  const retryDepth = +data.retryDepth || 0;
+
+  const retryDepthSum = +data.retryDepthSum || 0;
 
   return {
-    total_attempts: count,
-    success,
-    failures: failure,
+    total_attempts: total,
 
-    success_rate: count ? +(success / count).toFixed(3) : 0,
-    failure_rate: count ? +(failure / count).toFixed(3) : 0,
+    success: +data.success || 0,
+    failures: +data.failure || 0,
+    temporary_failures: +data.temporary || 0,
 
-    retry_amplification: original ? +((original + retry) / original).toFixed(2) : 0,
-    avg_retry_depth: retry ? +(retryDepth / retry).toFixed(2) : 0,
+    success_rate: total ? +(data.success / total).toFixed(3) : 0,
+    failure_rate: total ? +(data.failure / total).toFixed(3) : 0,
 
-    avg_pipeline_latency: count
-      ? +(data.pipelineLatency / count).toFixed(2)
-      : 0,
+    retry_amplification:
+      original ? +(total / original).toFixed(2) : 0,
 
-    avg_ingestion_latency: count
-      ? +(data.ingestionLatency / count).toFixed(2)
-      : 0,
+    avg_retry_depth:
+      retry ? +(retryDepthSum / retry).toFixed(2) : 0,
 
-    avg_latency: count
-      ? +(data.latency / count).toFixed(2)
-      : 0,
+    // ----------------------
+    // LATENCIES
+    // ----------------------
+    avg_pipeline_latency:
+      +((+data.pipelineLatencySum || 0) / total).toFixed(2),
+
+    avg_end_to_end_latency:
+      +((+data.endToEndLatencySum || 0) / total).toFixed(2),
+
+    avg_ingestion_latency:
+      +((+data.ingestionLatencySum || 0) / total).toFixed(2),
+
+    avg_latency:
+      +((+data.latencySum || 0) / total).toFixed(2),
+
+    // ----------------------
+    // 🔥 NEW BREAKDOWN
+    // ----------------------
+    avg_retry_delay:
+      +((+data.retryDelaySum || 0) / total).toFixed(2),
+
+    avg_queue_delay:
+      +((+data.queueDelaySum || 0) / total).toFixed(2),
+
+    avg_processing_time:
+      +((+data.processingTimeSum || 0) / total).toFixed(2)
   };
 }
 
+// ----------------------
+// 🔥 DUPLICATE CHECK
+// ----------------------
+async function isDuplicate(id) {
+  return await redisClient.exists(`processed:${id}`);
+}
+
+// ----------------------
+// 🔥 MARK PROCESSED
+// ----------------------
+async function markProcessed(id) {
+  await redisClient.set(`processed:${id}`, 1, { EX: 3600 });
+}
+
+// ----------------------
+// 🔥 DLQ STORAGE (SAFE)
+// ----------------------
+async function addToDLQ(log, reason) {
+  const key = `dlq:entry:${log.id}`;
+
+  await redisClient.hSet(key, {
+    id: String(log.id),
+    service: String(log.service || ''),
+    reason: String(reason || ''),
+
+    retry_count: String(log.retry_count || 0),
+    failed_at: String(Date.now())
+  });
+
+  await redisClient.expire(key, 86400);
+  await redisClient.sAdd('dlq_ids', String(log.id));
+}
+
+// ----------------------
+// 🔥 DLQ STATS
+// ----------------------
+async function getDLQStats() {
+  const ids = await redisClient.sMembers('dlq_ids');
+  if (!ids.length) return { count: 0 };
+
+  return { count: ids.length };
+}
+
+// ----------------------
 module.exports = {
   updateMetrics,
   getMetrics,
-  addToSet,
   addToDLQ,
   getDLQStats,
   isDuplicate,
-  markProcessed,
+  markProcessed
 };

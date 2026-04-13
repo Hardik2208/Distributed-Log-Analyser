@@ -8,8 +8,6 @@ const app = express();
 app.use(express.json());
 
 // ----------------------
-// 🔴 SAFE REDIS WRAPPER
-// ----------------------
 async function safeRedis(action, fallback = null) {
   try {
     if (!redisClient || !redisClient.isOpen) {
@@ -24,50 +22,39 @@ async function safeRedis(action, fallback = null) {
 }
 
 // ----------------------
-// 🔴 DB FAILURE CONTROL
+// DB CONTROL
 // ----------------------
 app.post('/control/db/down', async (req, res) => {
   await safeRedis(() => redisClient.set('db:failure', '1'));
-  console.log("🔥 DB FAILURE ENABLED");
   res.json({ db: "DOWN" });
 });
 
 app.post('/control/db/up', async (req, res) => {
   await safeRedis(() => redisClient.set('db:failure', '0'));
-  console.log("✅ DB RESTORED");
   res.json({ db: "UP" });
 });
 
 // ----------------------
-// 🔥 SYSTEM METRICS
+// SYSTEM METRICS
 // ----------------------
 app.get('/metrics/system', async (req, res) => {
   try {
     const metrics = await getSystemMetrics();
     const state = await safeRedis(() => redisClient.get("system:state"));
 
-    if (!metrics) {
-      return res.json({
-        success: true,
-        state,
-        message: "No metrics yet"
-      });
-    }
-
     res.json({
       success: true,
       state,
-      ...metrics
+      ...(metrics || {})
     });
 
   } catch (err) {
-    console.error("🔥 SYSTEM METRICS ERROR:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ----------------------
-// 🔥 LATEST METRICS
+// LATEST WINDOW METRICS
 // ----------------------
 app.get('/metrics/latest', async (req, res) => {
   try {
@@ -79,53 +66,74 @@ app.get('/metrics/latest', async (req, res) => {
     );
 
     if (!windows.length) {
-      return res.status(404).json({
-        success: false,
-        message: "No metrics yet"
-      });
+      return res.status(404).json({ success: false });
     }
 
-    const latestWindow = Math.max(
-      ...windows.map(w => Number(w)).filter(w => !isNaN(w))
+    const latest = Math.max(...windows.map(Number));
+    const data = await safeRedis(
+      () => redisClient.hGetAll(`${service}:${latest}`),
+      {}
     );
 
-    const key = `${service}:${latestWindow}`;
-    const data = await safeRedis(() => redisClient.hGetAll(key), {});
-
     if (!data || Object.keys(data).length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "No metrics yet"
-      });
+      return res.status(404).json({ success: false });
     }
 
-    const count = Number(data.count || 0);
-    const latency = Number(data.latency || 0);
-    const pipelineLatency = Number(data.pipelineLatency || 0);
-    const ingestionLatency = Number(data.ingestionLatency || 0);
+    const total = Number(data.total || 0);
+    if (total === 0) {
+      return res.json({ success: true, window: latest, total_attempts: 0 });
+    }
 
     res.json({
       success: true,
-      service,
-      timestamp: Date.now(),
-      window: latestWindow,
-      total_attempts: count,
-      avg_latency: count ? latency / count : 0,
-      avg_pipeline_latency: count ? pipelineLatency / count : 0,
-      avg_ingestion_latency: count ? ingestionLatency / count : 0
+      window: latest,
+
+      total_attempts: total,
+
+      success: Number(data.success || 0),
+      failures: Number(data.failure || 0),
+      temporary_failures: Number(data.temporary || 0),
+
+      retry_amplification:
+        Number(data.original || 0) === 0
+          ? 0
+          : total / Number(data.original || 0),
+
+      // ----------------------
+      // 🔥 CORE LATENCY
+      // ----------------------
+      avg_pipeline_latency:
+        Number(data.pipelineLatencySum || 0) / total,
+
+      avg_end_to_end_latency:
+        Number(data.endToEndLatencySum || 0) / total,
+
+      avg_ingestion_latency:
+        Number(data.ingestionLatencySum || 0) / total,
+
+      avg_latency:
+        Number(data.latencySum || 0) / total,
+
+      // ----------------------
+      // 🔥 NEW SIGNALS (CRITICAL)
+      // ----------------------
+      avg_retry_delay:
+        Number(data.retryDelaySum || 0) / total,
+
+      avg_queue_delay:
+        Number(data.queueDelaySum || 0) / total,
+
+      avg_processing_time:
+        Number(data.processingTimeSum || 0) / total
     });
 
   } catch (err) {
-    console.error("🔥 METRICS ERROR:", err.message);
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
 // ----------------------
-// 🔥 WINDOW METRICS
+// WINDOW METRICS
 // ----------------------
 app.get('/metrics/window', async (req, res) => {
   try {
@@ -136,88 +144,68 @@ app.get('/metrics/window', async (req, res) => {
       []
     );
 
-    if (!windows.length) {
-      return res.json({
-        success: true,
-        windows: []
-      });
-    }
-
-    const sortedWindows = windows
-      .map(w => Number(w))
-      .filter(w => !isNaN(w))
-      .sort((a, b) => b - a)
-      .slice(0, 10);
-
     const result = [];
 
-    for (const window of sortedWindows) {
-      const key = `${service}:${window}`;
-      const data = await safeRedis(() => redisClient.hGetAll(key), {});
-
+    for (const window of windows.map(Number).sort((a,b)=>b-a).slice(0,10)) {
+      const data = await safeRedis(() => redisClient.hGetAll(`${service}:${window}`), {});
       if (!data || Object.keys(data).length === 0) continue;
 
-      const count = Number(data.count || 0);
-      const success = Number(data.success || 0);
-      const failure = Number(data.failure || 0);
-
-      const latency = Number(data.latency || 0);
-      const pipelineLatency = Number(data.pipelineLatency || 0);
-      const ingestionLatency = Number(data.ingestionLatency || 0);
-
-      const original = Number(data.original || 0);
-      const retry = Number(data.retry || 0);
-
-      const retry_amplification =
-        original === 0 ? 0 : (retry / original);
+      const total = Number(data.total || 0);
 
       result.push({
         window,
-        total_attempts: count,
-        success,
-        failures: failure,
-        retry_amplification,
-        avg_pipeline_latency: count ? pipelineLatency / count : 0,
-        avg_ingestion_latency: count ? ingestionLatency / count : 0,
-        avg_latency: count ? latency / count : 0
+        total_attempts: total,
+        success: Number(data.success || 0),
+        failures: Number(data.failure || 0),
+        temporary_failures: Number(data.temporary || 0),
+
+        retry_amplification:
+          Number(data.original || 0) === 0
+            ? 0
+            : total / Number(data.original || 0),
+
+        avg_pipeline_latency:
+          total ? Number(data.pipelineLatencySum || 0) / total : 0,
+
+        avg_end_to_end_latency:
+          total ? Number(data.endToEndLatencySum || 0) / total : 0,
+
+        avg_ingestion_latency:
+          total ? Number(data.ingestionLatencySum || 0) / total : 0,
+
+        avg_latency:
+          total ? Number(data.latencySum || 0) / total : 0,
+        
+        avg_retry_delay:
+          Number(data.retryDelaySum || 0) / total,
+
+        avg_queue_delay:
+          Number(data.queueDelaySum || 0) / total,
+
+        avg_processing_time:
+          Number(data.processingTimeSum || 0) / total
       });
     }
 
-    res.json({
-      success: true,
-      service,
-      windows: result
-    });
+    res.json({ success: true, windows: result });
 
   } catch (err) {
-    console.error("🔥 WINDOW METRICS ERROR:", err.message);
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  }
-});
-
-// ----------------------
-// 🔥 DLQ STATS
-// ----------------------
-app.get('/dlq/stats', async (req, res) => {
-  try {
-    const stats = await getDLQStats();
-
-    res.json({
-      success: true,
-      stats
-    });
-
-  } catch (err) {
-    console.error("🔥 DLQ ERROR:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ----------------------
-// 🔥 HEALTH CHECK
+// DLQ
+// ----------------------
+app.get('/dlq/stats', async (req, res) => {
+  try {
+    const stats = await getDLQStats();
+    res.json({ success: true, stats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ----------------------
 app.get('/health', async (req, res) => {
   res.json({
@@ -228,31 +216,15 @@ app.get('/health', async (req, res) => {
 });
 
 // ----------------------
-// 🚀 START SERVER
-// ----------------------
 async function start() {
   await connectRedis();
 
-  // default state
   await redisClient.set('db:failure', '0');
 
-  // 🔥 START CONTROL LOOP AFTER REDIS
-  //startControlLoop("order");
+  startControlLoop("order");
 
   app.listen(3000, () => {
     console.log("🚀 Server running on 3000");
-
-    console.log("📊 System:");
-    console.log("http://localhost:3000/metrics/system");
-
-    console.log("📊 Latest:");
-    console.log("http://localhost:3000/metrics/latest?service=order");
-
-    console.log("📊 Window:");
-    console.log("http://localhost:3000/metrics/window?service=order");
-
-    console.log("💀 DLQ:");
-    console.log("http://localhost:3000/dlq/stats");
   });
 }
 

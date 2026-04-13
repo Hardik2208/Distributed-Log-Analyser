@@ -2,20 +2,15 @@ const { redisClient } = require('../config/redisClient');
 
 const metricsBuffer = [];
 
-// 🔥 CONTROL LIMITS (UNCHANGED)
+// 🔥 CONFIG
 const MAX_BUFFER_SIZE = 5000;
 const FLUSH_BATCH_SIZE = 200;
 const FLUSH_INTERVAL = 200;
-
-// 🔥 NEW: PARALLEL WORKERS
 const WORKERS = 3;
 
 // ----------------------
 function pushMetric(metric) {
-  console.log("📥 PUSH METRIC", metric.service);
-  // 🔥 MEMORY PROTECTION (FIXED: DROP NEW, NOT OLD)
   if (metricsBuffer.length >= MAX_BUFFER_SIZE) {
-    // do NOT shift old data → preserve history integrity
     return;
   }
 
@@ -25,67 +20,123 @@ function pushMetric(metric) {
 // ----------------------
 async function flushMetrics() {
 
-  // 🔥 SIMPLE EXIT (NO TIME GATING, NO GLOBAL LOCK)
   if (metricsBuffer.length === 0) return;
 
-  // 🔥 PROCESS ONLY ONE BATCH (CRITICAL FIX)
   const size = Math.min(metricsBuffer.length, FLUSH_BATCH_SIZE);
   const batch = metricsBuffer.splice(0, size);
 
   const aggregated = {};
 
+  const safeNum = (v) => {
+    const n = Number(v);
+    return Number.isNaN(n) ? 0 : n;
+  };
+
   // ----------------------
-  // 🔥 SAME AGGREGATION LOGIC (UNCHANGED)
+  // 🔥 AGGREGATION (UPDATED)
   // ----------------------
   for (const m of batch) {
+
+    if (!m || typeof m !== "object") continue;
+    if (typeof m.service !== "string" || !m.window) continue;
+
     const key = `${m.service}:${m.window}`;
 
     if (!aggregated[key]) {
       aggregated[key] = {
         service: m.service,
         window: m.window,
-        count: 0,
+
+        total: 0,
         success: 0,
         failure: 0,
-        latency: 0,
-        pipelineLatency: 0,
-        ingestionLatency: 0,
+        temporary: 0,
+
         original: 0,
-        retry: 0
+        retry: 0,
+
+        retryDepthSum: 0,
+
+        latencySum: 0,
+        pipelineLatencySum: 0,
+        endToEndLatencySum: 0,
+        ingestionLatencySum: 0,
+
+        // 🔥 NEW SIGNALS
+        retryDelaySum: 0,
+        queueDelaySum: 0,
+        processingTimeSum: 0
       };
     }
 
-    aggregated[key].count++;
+    const agg = aggregated[key];
 
-    if (m.success) aggregated[key].success++;
-    if (m.failed) aggregated[key].failure++;
+    // ----------------------
+    // COUNTS
+    // ----------------------
+    agg.total++;
 
-    if (m.isFirstAttempt) aggregated[key].original++;
-    if (m.isRetry) aggregated[key].retry++;
+    if (m.success === true) agg.success++;
+    if (m.failed === true) agg.failure++;
+    if (m.isTemporaryFailure === true) agg.temporary++;
 
-    aggregated[key].latency += m.latency;
-    aggregated[key].pipelineLatency += m.pipelineLatency || 0;
-    aggregated[key].ingestionLatency += m.ingestionLatency || 0;
+    // ----------------------
+    // ATTEMPT TYPE
+    // ----------------------
+    if (m.isFirstAttempt === true) agg.original++;
+    if (m.isRetry === true) agg.retry++;
+
+    // ----------------------
+    // RETRY DEPTH
+    // ----------------------
+    agg.retryDepthSum += safeNum(m.retryCount);
+
+    // ----------------------
+    // LATENCIES
+    // ----------------------
+    agg.latencySum += safeNum(m.latency);
+    agg.pipelineLatencySum += safeNum(m.pipelineLatency);
+    agg.endToEndLatencySum += safeNum(m.endToEndLatency);
+    agg.ingestionLatencySum += safeNum(m.ingestionLatency);
+
+    // ----------------------
+    // 🔥 NEW METRICS (CRITICAL)
+    // ----------------------
+    agg.retryDelaySum += safeNum(m.retryDelay);
+    agg.queueDelaySum += safeNum(m.queueDelay);
+    agg.processingTimeSum += safeNum(m.processingTime);
   }
 
+  // ----------------------
+  // 🔥 REDIS WRITE (UPDATED)
+  // ----------------------
   try {
     const pipeline = redisClient.multi();
 
     for (const key in aggregated) {
-      const data = aggregated[key];
+      const d = aggregated[key];
 
-      pipeline.sAdd(`metrics:windows:${data.service}`, String(data.window));
+      pipeline.sAdd(`metrics:windows:${d.service}`, String(d.window));
 
-      pipeline.hIncrBy(key, "count", data.count);
-      pipeline.hIncrBy(key, "success", data.success);
-      pipeline.hIncrBy(key, "failure", data.failure);
+      pipeline.hIncrBy(key, "total", d.total);
+      pipeline.hIncrBy(key, "success", d.success);
+      pipeline.hIncrBy(key, "failure", d.failure);
+      pipeline.hIncrBy(key, "temporary", d.temporary);
 
-      pipeline.hIncrBy(key, "original", data.original);
-      pipeline.hIncrBy(key, "retry", data.retry);
+      pipeline.hIncrBy(key, "original", d.original);
+      pipeline.hIncrBy(key, "retry", d.retry);
 
-      pipeline.hIncrByFloat(key, "latency", data.latency);
-      pipeline.hIncrByFloat(key, "pipelineLatency", data.pipelineLatency);
-      pipeline.hIncrByFloat(key, "ingestionLatency", data.ingestionLatency);
+      pipeline.hIncrBy(key, "retryDepthSum", d.retryDepthSum);
+
+      pipeline.hIncrByFloat(key, "latencySum", d.latencySum);
+      pipeline.hIncrByFloat(key, "pipelineLatencySum", d.pipelineLatencySum);
+      pipeline.hIncrByFloat(key, "endToEndLatencySum", d.endToEndLatencySum);
+      pipeline.hIncrByFloat(key, "ingestionLatencySum", d.ingestionLatencySum);
+
+      // 🔥 NEW REDIS FIELDS
+      pipeline.hIncrByFloat(key, "retryDelaySum", d.retryDelaySum);
+      pipeline.hIncrByFloat(key, "queueDelaySum", d.queueDelaySum);
+      pipeline.hIncrByFloat(key, "processingTimeSum", d.processingTimeSum);
 
       pipeline.expire(key, 3600);
     }
@@ -98,7 +149,7 @@ async function flushMetrics() {
 }
 
 // ----------------------
-// 🔥 PARALLEL FLUSH WORKERS (REAL FIX)
+// 🔥 WORKERS
 // ----------------------
 for (let i = 0; i < WORKERS; i++) {
   setInterval(() => {

@@ -1,5 +1,5 @@
 const { redisClient } = require('../config/redisClient');
-const { pushMetric } = require('../metrics/metricsBuffer'); // 🔥 FIXED IMPORT
+const { pushMetric } = require('../metrics/metricsBuffer');
 
 const WINDOW_KEY = 'metrics_window';
 const WINDOW_SIZE = 200;
@@ -22,7 +22,7 @@ async function safeExec(fn, fallback = null) {
 }
 
 // ----------------------
-// 🔥 LIGHTWEIGHT STREAM METRICS (OPTIONAL)
+// 🔥 OPTIONAL STREAM (DEBUG)
 async function recordMetrics({ status, latency }) {
   const entry = JSON.stringify({ status, latency, ts: Date.now() });
 
@@ -31,57 +31,37 @@ async function recordMetrics({ status, latency }) {
 }
 
 // ----------------------
-// 🔥 FINAL METRICS ENTRY (SOURCE OF TRUTH)
-async function updateMetrics({
-  service,
-  window,
-  isRetry,
-  isFirstAttempt,
-  retryCount,
-  failed,
-  latency,
-  pipelineLatency,
-  ingestionLatency,
-  success,
-  isRetrySuccess,
-  isRetryFailure,
-}) {
-  const serviceName = service || 'order';
-
-  if (!window) {
-    console.error('🔥 INVALID WINDOW', { serviceName, window });
+// 🔥 FINAL METRIC → BUFFER
+async function updateMetrics(payload) {
+  if (!payload?.window) {
+    console.error('🔥 INVALID METRIC PAYLOAD');
     return;
   }
 
-  // 🔥 REDIRECT TO BUFFER (NO REDIS HERE)
-  pushMetric({
-    service: serviceName,
-    window,
-    isRetry,
-    isFirstAttempt,
-    retryCount,
-    failed,
-    success,
-    latency,
-    pipelineLatency,
-    ingestionLatency,
-    isRetrySuccess,
-    isRetryFailure
-  });
+  pushMetric(payload);
 }
 
 // ----------------------
-// 🔥 SYSTEM METRICS (USED BY CONTROL LOOP)
+// 🔥 SYSTEM METRICS (UPDATED)
+// ----------------------
 async function getSystemMetrics() {
 
-  let totalSuccess = 0;
-  let totalFailures = 0;
-  let totalPipelineLatency = 0;
-  let totalAttempts = 0;
-  let totalOriginal = 0;
-  let totalRetry = 0;
+  let total = 0;
+  let success = 0;
+  let failure = 0;
+  let temporary = 0;
 
-  // 🔥 FIX: USE SET INSTEAD OF SCAN
+  let pipelineSum = 0;
+  let endToEndSum = 0;
+
+  // 🔥 NEW SIGNALS
+  let retryDelaySum = 0;
+  let queueDelaySum = 0;
+  let processingTimeSum = 0;
+
+  let original = 0;
+  let retry = 0;
+
   const windows = await safeExec(
     () => redisClient.sMembers(`metrics:windows:order`),
     []
@@ -89,36 +69,54 @@ async function getSystemMetrics() {
 
   if (!windows.length) return null;
 
-  // 🔥 FIX: ONLY LAST 3 WINDOWS (PREVENT OLD DATA POLLUTION)
-  const recentWindows = windows
+  const recent = windows
     .map(Number)
     .sort((a, b) => b - a)
     .slice(0, 3);
 
-  for (const w of recentWindows) {
+  for (const w of recent) {
     const key = `order:${w}`;
     const data = await safeExec(() => redisClient.hGetAll(key), {});
 
-    totalSuccess += Number(data.success || 0);
-    totalFailures += Number(data.failure || 0);
-    totalPipelineLatency += Number(data.pipelineLatency || 0);
-    totalAttempts += Number(data.count || 0);
+    total += Number(data.total || 0);
+    success += Number(data.success || 0);
+    failure += Number(data.failure || 0);
+    temporary += Number(data.temporary || 0);
 
-    totalOriginal += Number(data.original || 0);
-    totalRetry += Number(data.retry || 0);
+    pipelineSum += Number(data.pipelineLatencySum || 0);
+    endToEndSum += Number(data.endToEndLatencySum || 0);
+
+    // 🔥 NEW FIELDS (CRITICAL)
+    retryDelaySum += Number(data.retryDelaySum || 0);
+    queueDelaySum += Number(data.queueDelaySum || 0);
+    processingTimeSum += Number(data.processingTimeSum || 0);
+
+    original += Number(data.original || 0);
+    retry += Number(data.retry || 0);
   }
 
-  if (totalAttempts === 0) return null;
+  if (total === 0) return null;
 
   // ----------------------
-  // 🔥 FINAL METRICS
+  // CORE RATES
   // ----------------------
-  const failureRate = totalFailures / totalAttempts;
-  const successRate = totalSuccess / totalAttempts;
-  const avgPipelineLatency = totalPipelineLatency / totalAttempts;
+  const failureRate = failure / total;
+  const successRate = success / total;
+  const temporaryFailureRate = temporary / total;
+
+  // ----------------------
+  // LATENCIES
+  // ----------------------
+  const avgPipelineLatency = pipelineSum / total;
+  const avgEndToEndLatency = endToEndSum / total;
+
+  // 🔥 NEW BREAKDOWN
+  const avgRetryDelay = retryDelaySum / total;
+  const avgQueueDelay = queueDelaySum / total;
+  const avgProcessingTime = processingTimeSum / total;
 
   const retryAmplification =
-    totalOriginal === 0 ? 0 : (totalRetry + totalOriginal) / totalOriginal;
+    original === 0 ? 0 : total / original;
 
   // ----------------------
   // BASELINE
@@ -142,7 +140,16 @@ async function getSystemMetrics() {
   return {
     failure_rate: failureRate,
     success_rate: successRate,
+    temporary_failure_rate: temporaryFailureRate,
+
     avg_pipeline_latency: avgPipelineLatency,
+    avg_end_to_end_latency: avgEndToEndLatency,
+
+    // 🔥 NEW INTELLIGENCE
+    avg_retry_delay: avgRetryDelay,
+    avg_queue_delay: avgQueueDelay,
+    avg_processing_time: avgProcessingTime,
+
     retry_amplification: retryAmplification,
     baseline_latency: baselineLatency,
   };
@@ -163,7 +170,8 @@ async function updateBaseline(currentAvg) {
 }
 
 // ----------------------
-// 🔥 ATTEMPT METRICS (NOT FINAL TRUTH)
+// 🔥 DEBUG ONLY
+// ----------------------
 async function recordAmplification(isRetry) {
   const windowKey = `retry_amp:${Math.floor(Date.now() / 60000) * 60000}`;
   const field = isRetry ? 'retry' : 'original';
