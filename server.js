@@ -99,9 +99,6 @@ app.get('/metrics/latest', async (req, res) => {
           ? 0
           : total / Number(data.original || 0),
 
-      // ----------------------
-      // 🔥 CORE LATENCY
-      // ----------------------
       avg_pipeline_latency:
         Number(data.pipelineLatencySum || 0) / total,
 
@@ -114,9 +111,6 @@ app.get('/metrics/latest', async (req, res) => {
       avg_latency:
         Number(data.latencySum || 0) / total,
 
-      // ----------------------
-      // 🔥 NEW SIGNALS (CRITICAL)
-      // ----------------------
       avg_retry_delay:
         Number(data.retryDelaySum || 0) / total,
 
@@ -193,6 +187,75 @@ app.get('/metrics/window', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ======================================================
+// 🔴 NEW: ANOMALY ENDPOINTS (ONLY ADDITION)
+// ======================================================
+
+// ----------------------
+// ALL ANOMALIES
+// ----------------------
+app.get('/anomalies', async (req, res) => {
+  try {
+    const service = req.query.service || 'order';
+
+    const data = await safeRedis(
+      () => redisClient.lRange(`anomalies:${service}`, 0, 20),
+      []
+    );
+
+    const parsed = data.map(d => {
+      try {
+        return JSON.parse(d);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+
+    res.json({
+      success: true,
+      count: parsed.length,
+      anomalies: parsed
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------
+// LATEST ANOMALY
+// ----------------------
+app.get('/anomalies/latest', async (req, res) => {
+  try {
+    const service = req.query.service || 'order';
+
+    const data = await safeRedis(
+      () => redisClient.lIndex(`anomalies:${service}`, 0),
+      null
+    );
+
+    if (!data) {
+      return res.json({ success: true, anomaly: null });
+    }
+
+    let parsed = null;
+
+    try {
+      parsed = JSON.parse(data);
+    } catch {}
+
+    res.json({
+      success: true,
+      anomaly: parsed
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ======================================================
 
 // ----------------------
 // DLQ
