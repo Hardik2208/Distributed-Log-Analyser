@@ -1,23 +1,68 @@
 const { Kafka } = require('kafkajs');
 const { v4: uuidv4 } = require('uuid');
 
+// --------------------------------
+// ENV VALIDATION
+// --------------------------------
+const broker = process.env.KAFKA_BROKER;
+
+if (!broker) {
+  throw new Error("❌ KAFKA_BROKER is not defined");
+}
+
+console.log("🚀 Connecting to Kafka:", broker);
+
+// --------------------------------
+// KAFKA INIT
+// --------------------------------
 const kafka = new Kafka({
   clientId: 'adaptive-producer',
-  brokers: ['localhost:9092'],
+  brokers: [broker],
 });
 
+// --------------------------------
+// CLIENTS
+// --------------------------------
 const producer = kafka.producer();
-const controlConsumer = kafka.consumer({ groupId: 'producer-control' });
+const controlConsumer = kafka.consumer({
+  groupId: 'producer-control',
+});
+
+// --------------------------------
+// CONNECTION HELPERS
+// --------------------------------
+async function connectProducer(retries = 5) {
+  try {
+    await producer.connect();
+    console.log("✅ Producer connected");
+  } catch (err) {
+    console.log(`⏳ Retrying producer connect... (${retries})`);
+    if (retries === 0) throw err;
+    await new Promise(res => setTimeout(res, 3000));
+    return connectProducer(retries - 1);
+  }
+}
+
+async function connectControlConsumer(retries = 5) {
+  try {
+    await controlConsumer.connect();
+    console.log("✅ Control consumer connected");
+  } catch (err) {
+    console.log(`⏳ Retrying control consumer... (${retries})`);
+    if (retries === 0) throw err;
+    await new Promise(res => setTimeout(res, 3000));
+    return connectControlConsumer(retries - 1);
+  }
+}
 
 // --------------------------------
 // CONTROL STATE
 // --------------------------------
-let baseRate = 10000;
+let baseRate = 1000;          // 🔥 FIXED to 1k/sec
 let externalFactor = 1.0;
 
-// 🔴 FIXED (REAL CONTROL RANGE)
-const MIN_RATE = 10000;
-const MAX_RATE = 10000;
+const MIN_RATE = 1000;
+const MAX_RATE = 1000;
 
 // --------------------------------
 // SERVICE CONFIG
@@ -25,12 +70,12 @@ const MAX_RATE = 10000;
 const SERVICE = "order";
 
 // --------------------------------
-// PRIORITY CONFIG (NEW)
+// PRIORITY CONFIG
 // --------------------------------
 const PRIORITY_WEIGHTS = [
-  { type: "HIGH", weight: 0.1 },   // critical logs
+  { type: "HIGH", weight: 0.1 },
   { type: "MEDIUM", weight: 0.3 },
-  { type: "LOW", weight: 0.6 }     // bulk logs
+  { type: "LOW", weight: 0.6 }
 ];
 
 // --------------------------------
@@ -74,7 +119,6 @@ function pickWeighted(arr) {
   return arr[0].path;
 }
 
-// 🔥 PRIORITY PICKER
 function pickPriority() {
   const r = Math.random();
   let sum = 0;
@@ -86,7 +130,6 @@ function pickPriority() {
   return "LOW";
 }
 
-// 🔥 ENDPOINT PICKER
 function pickEndpoint() {
   if (Math.random() < INVALID_RATE) {
     return pickWeighted(INVALID_ENDPOINTS);
@@ -98,11 +141,12 @@ function pickEndpoint() {
 // CONTROL SIGNAL CONSUMER
 // --------------------------------
 async function startControlConsumer() {
-  await controlConsumer.connect();
   await controlConsumer.subscribe({
     topic: 'control-signals',
     fromBeginning: false
   });
+
+  console.log("🎧 Control consumer subscribed");
 
   await controlConsumer.run({
     eachMessage: async ({ message }) => {
@@ -111,10 +155,7 @@ async function startControlConsumer() {
 
         if (signal.type === "RATE_ADJUST") {
           externalFactor = signal.factor;
-
-          console.log(
-            `🎯 CONTROL UPDATE → factor=${externalFactor.toFixed(2)}`
-          );
+          console.log(`🎯 CONTROL UPDATE → factor=${externalFactor.toFixed(2)}`);
         }
 
       } catch (err) {
@@ -128,29 +169,25 @@ async function startControlConsumer() {
 // MAIN PRODUCER LOOP
 // --------------------------------
 async function run() {
-  await producer.connect();
+  await connectProducer();
+  await connectControlConsumer();
   await startControlConsumer();
 
-  console.log("🚀 PRODUCER STARTED");
+  console.log("🚀 PRODUCER STARTED (1K/sec)");
+
+  const MAX_BATCH = 300;   // 🔥 SAFE LIMIT
 
   while (true) {
 
-    // --------------------------------
-    // 1. APPLY CONTROL FACTOR (FIXED)
-    // --------------------------------
     let adjustedRate = baseRate * externalFactor;
-
     adjustedRate = Math.max(MIN_RATE, Math.min(MAX_RATE, adjustedRate));
 
-    const batchSize = Math.floor(adjustedRate);
+    const totalMessages = Math.floor(adjustedRate);
 
-    // --------------------------------
-    // 2. BUILD BATCH (PRIORITY ADDED)
-    // --------------------------------
-    const batch = [];
     const now = Date.now();
+    const batch = [];
 
-    for (let i = 0; i < batchSize; i++) {
+    for (let i = 0; i < totalMessages; i++) {
 
       const endpoint = pickEndpoint();
       const priority = pickPriority();
@@ -172,7 +209,6 @@ async function run() {
         region: "ap-south-1",
         retry_count: 0,
 
-        // 🔴 NEW: PRIORITY FIELD
         priority
       };
 
@@ -182,18 +218,18 @@ async function run() {
       });
     }
 
-    // --------------------------------
-    // 3. SEND
-    // --------------------------------
     try {
-      await producer.send({
-        topic: 'logs',
-        messages: batch,
-      });
+      // 🔥 SPLIT INTO SAFE CHUNKS
+      for (let i = 0; i < batch.length; i += MAX_BATCH) {
+        const chunk = batch.slice(i, i + MAX_BATCH);
 
-      console.log(
-        `📤 Sent=${batch.length} | factor=${externalFactor.toFixed(2)}`
-      );
+        await producer.send({
+          topic: 'logs',
+          messages: chunk,
+        });
+      }
+
+      console.log(`📤 Sent=${totalMessages} (chunked)`);
 
     } catch (err) {
       console.error("🔥 PRODUCER SEND FAILED:", err.message);
@@ -201,17 +237,6 @@ async function run() {
       continue;
     }
 
-    // --------------------------------
-    // 4. CONTROLLED DRIFT
-    // --------------------------------
-    if (Math.random() < 0.2) {
-      baseRate *= random(97, 103) / 100;
-      baseRate = Math.max(MIN_RATE, Math.min(MAX_RATE, baseRate));
-    }
-
-    // --------------------------------
-    // 5. STABLE INTERVAL
-    // --------------------------------
     await new Promise(res => setTimeout(res, 1000));
   }
 }

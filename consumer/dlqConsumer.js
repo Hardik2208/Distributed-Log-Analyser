@@ -2,16 +2,45 @@ const { Kafka } = require('kafkajs');
 const pLimit = require('p-limit').default;
 
 const { connectRedis, redisClient } = require('../config/redisClient');
-const { addToDLQ } = require('../metrics/dlqService'); // ✅ FIXED
+const { addToDLQ } = require('../metrics/dlqService');
 
+// --------------------------------
+// ENV VALIDATION
+// --------------------------------
+const broker = process.env.KAFKA_BROKER;
+
+if (!broker) {
+  throw new Error("❌ KAFKA_BROKER is not defined");
+}
+
+console.log("💀 DLQ CONSUMER connecting to Kafka:", broker);
+
+// --------------------------------
+// KAFKA INIT
+// --------------------------------
 const kafka = new Kafka({
   clientId: 'dlq-consumer',
-  brokers: ['localhost:9092'],
+  brokers: [broker],
 });
 
 const consumer = kafka.consumer({ groupId: 'log-group-dlq' });
 
 const limit = pLimit(20);
+
+// --------------------------------
+// CONNECTION HELPER (RETRY)
+// --------------------------------
+async function connectConsumer(retries = 5) {
+  try {
+    await consumer.connect();
+    console.log("✅ DLQ consumer connected");
+  } catch (err) {
+    console.log(`⏳ Retrying DLQ consumer connect... (${retries})`);
+    if (retries === 0) throw err;
+    await new Promise(res => setTimeout(res, 3000));
+    return connectConsumer(retries - 1);
+  }
+}
 
 // ----------------------
 async function commitOffset(topic, partition, message) {
@@ -25,7 +54,7 @@ async function commitOffset(topic, partition, message) {
 // ----------------------
 async function run() {
   await connectRedis();
-  await consumer.connect();
+  await connectConsumer();
 
   await consumer.subscribe({ topic: 'logs-dlq', fromBeginning: false });
 

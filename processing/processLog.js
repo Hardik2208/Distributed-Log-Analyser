@@ -9,7 +9,13 @@ const getWindow = (timestamp) =>
 
 // ----------------------
 const processLog = async (log) => {
-  validate(log);
+  // 🔒 VALIDATION (PERMANENT FAILURE)
+  try {
+    validate(log);
+  } catch (err) {
+    err.type = "PERMANENT";
+    throw err;
+  }
 
   // ----------------------
   // 🔥 NORMALIZATION
@@ -28,7 +34,7 @@ const processLog = async (log) => {
   const processedKey = `processed:${log.id}`;
 
   // ----------------------
-  // 🔥 TIME REFERENCES (CORRECTED)
+  // 🔥 TIME REFERENCES
   // ----------------------
   const attemptTs = Number(log.attempt_timestamp) || Date.now();
   const queueEnteredAt = Number(log.queue_entered_at) || timestamp;
@@ -46,57 +52,41 @@ const processLog = async (log) => {
     if (!claimed) {
       return { status: "SKIPPED_ALREADY_PROCESSED" };
     }
-  } catch {
+  } catch (err) {
     return { status: "ERROR_CLAIM_FAILED" };
   }
 
-  // ----------------------
-  // 🔥 EXECUTION START
-  // ----------------------
   const executionStart = Date.now();
 
   try {
-    const dbFailure = await redisClient.get('db:failure');
-
-    if (dbFailure === '1') {
-      const error = new Error("DB_DOWN");
-      error.type = "TEMPORARY";
-      throw error;
-    }
-
     // ----------------------
-    // ✅ SUCCESS
+    // 🔥 REAL EXECUTION LAYER
     // ----------------------
-    const executionEnd = Date.now();
-
-    // ----------------------
-    // 🔥 CORRECT LATENCIES
-    // ----------------------
-    const queueDelay = attemptTs - queueEnteredAt;
-    const processingTime = executionEnd - attemptTs;
-    const pipelineLatency = executionEnd - queueEnteredAt;
-    const endToEndLatency = executionEnd - timestamp;
-    const retryDelay = queueEnteredAt - retryScheduledAt;
-
-    // ----------------------
-    // DB WRITE
-    // ----------------------
-    pushToDBQueue({
+    // Replace this with actual DB/service calls
+    await pushToDBQueue({
       service,
       window_start: new Date(window),
       request_count: 1,
       error_count: 0,
       error_rate: 0,
       avg_latency: latency,
-      avg_pipeline_latency: pipelineLatency,
+      avg_pipeline_latency: 0,
       avg_ingestion_latency: ingestionLatency,
       retry_amplification: 0,
       avg_retry_depth: retryCount,
     });
 
     // ----------------------
-    // METRIC
+    // ✅ SUCCESS
     // ----------------------
+    const executionEnd = Date.now();
+
+    const queueDelay = attemptTs - queueEnteredAt;
+    const processingTime = executionEnd - attemptTs;
+    const pipelineLatency = executionEnd - queueEnteredAt;
+    const endToEndLatency = executionEnd - timestamp;
+    const retryDelay = queueEnteredAt - retryScheduledAt;
+
     pushMetric({
       service,
       window,
@@ -113,7 +103,6 @@ const processLog = async (log) => {
       endToEndLatency,
       ingestionLatency,
 
-      // 🔥 CORRECT SIGNALS
       retryDelay,
       queueDelay,
       processingTime
@@ -129,10 +118,15 @@ const processLog = async (log) => {
     const endToEndLatency = executionEnd - timestamp;
     const retryDelay = queueEnteredAt - retryScheduledAt;
 
-    const isTemporary = err.type === "TEMPORARY";
+    // 🔥 ERROR CLASSIFICATION (CRITICAL)
+    const isTemporary =
+      err.code === 'ECONNREFUSED' ||
+      err.code === 'ETIMEDOUT' ||
+      err.message?.includes('timeout') ||
+      err.type === "TEMPORARY";
 
     // ----------------------
-    // 🔴 TEMPORARY FAILURE
+    // 🔁 TEMPORARY FAILURE
     // ----------------------
     if (isTemporary) {
 
@@ -157,15 +151,17 @@ const processLog = async (log) => {
         processingTime
       });
 
+      // 🔁 allow retry
       try {
         await redisClient.del(processedKey);
       } catch {}
 
+      err.type = "TEMPORARY";
       throw err;
     }
 
     // ----------------------
-    // 🔴 PERMANENT FAILURE
+    // 💀 PERMANENT FAILURE
     // ----------------------
     pushToDBQueue({
       service,

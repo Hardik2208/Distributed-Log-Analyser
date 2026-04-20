@@ -5,9 +5,23 @@ const { redisClient, connectRedis } = require('../config/redisClient');
 const { processLog } = require('../processing/processLog');
 const { shouldRetry } = require('../control/circuitBreaker');
 
+// --------------------------------
+// ENV VALIDATION
+// --------------------------------
+const broker = process.env.KAFKA_BROKER;
+
+if (!broker) {
+  throw new Error("❌ KAFKA_BROKER is not defined");
+}
+
+console.log("🔁 RETRY CONSUMER connecting to Kafka:", broker);
+
+// --------------------------------
+// KAFKA INIT
+// --------------------------------
 const kafka = new Kafka({
   clientId: 'retry-consumer',
-  brokers: ['localhost:9092'],
+  brokers: [broker],
 });
 
 const consumer = kafka.consumer({
@@ -17,6 +31,33 @@ const consumer = kafka.consumer({
 });
 
 const producer = kafka.producer();
+
+// --------------------------------
+// CONNECTION HELPERS (RETRY ADDED)
+// --------------------------------
+async function connectConsumer(retries = 5) {
+  try {
+    await consumer.connect();
+    console.log("✅ Retry consumer connected");
+  } catch (err) {
+    console.log(`⏳ Retrying retry-consumer connect... (${retries})`);
+    if (retries === 0) throw err;
+    await new Promise(res => setTimeout(res, 3000));
+    return connectConsumer(retries - 1);
+  }
+}
+
+async function connectProducer(retries = 5) {
+  try {
+    await producer.connect();
+    console.log("✅ Retry producer connected");
+  } catch (err) {
+    console.log(`⏳ Retrying retry-producer connect... (${retries})`);
+    if (retries === 0) throw err;
+    await new Promise(res => setTimeout(res, 3000));
+    return connectProducer(retries - 1);
+  }
+}
 
 // ======================================================
 // 🔥 HIGH CONCURRENCY (NO STARVATION)
@@ -90,8 +131,8 @@ async function commitOffset(topic, partition, message) {
 // ======================================================
 async function run() {
   await connectRedis();
-  await consumer.connect();
-  await producer.connect();
+  await connectConsumer();
+  await connectProducer();
 
   await consumer.subscribe({ topic: 'logs-retry', fromBeginning: false });
 
@@ -115,16 +156,10 @@ async function run() {
           const now = Date.now();
           const priority = log.priority || "LOW";
 
-          // ======================================================
-          // 🔴 INPUT TRACE
-          // ======================================================
           if (shouldLog()) {
             console.log(`📥 RETRY_IN id=${log.id} r=${log.retry_count}`);
           }
 
-          // ======================================================
-          // 🔴 DELAY HANDLING (NON-BLOCKING)
-          // ======================================================
           const nextRetryAt = Number(log.next_retry_at || 0);
           const waitTime = nextRetryAt - now;
 
@@ -132,7 +167,6 @@ async function run() {
 
             if (waitTime <= 2000) {
 
-              // record retry delay properly
               log.retry_delay = waitTime;
 
               await commitOffset(topic, partition, message);
@@ -152,15 +186,12 @@ async function run() {
 
                   await processLog(execLog);
 
-                } catch (err) {
-                  // fallback handled in main pipeline next cycle
-                }
+                } catch (err) {}
               }, waitTime);
 
               return;
             }
 
-            // long delay → requeue
             if (shouldLog()) {
               console.log(`⏳ REQUEUE_LONG id=${log.id} delay=${waitTime}`);
             }
@@ -182,18 +213,12 @@ async function run() {
             return;
           }
 
-          // ======================================================
-          // 🔐 IDEMPOTENCY
-          // ======================================================
           const exists = await redisClient.exists(`processed:${log.id}`);
           if (exists) {
             await commitOffset(topic, partition, message);
             return;
           }
 
-          // ======================================================
-          // 🔥 MAX RETRY → DLQ
-          // ======================================================
           if (log.retry_count >= MAX_RETRY) {
 
             if (shouldLog()) {
@@ -215,9 +240,6 @@ async function run() {
             return;
           }
 
-          // ======================================================
-          // 🔴 LOAD SHEDDING
-          // ======================================================
           const isOverloaded =
             cachedState.circuitState === "OPEN" ||
             cachedState.systemState === "OVERLOADED" ||
@@ -245,9 +267,6 @@ async function run() {
             }
           }
 
-          // ======================================================
-          // 🔴 CIRCUIT BREAKER
-          // ======================================================
           const allowRetry = await shouldRetry();
 
           if (!allowRetry) {
@@ -272,9 +291,6 @@ async function run() {
             }
           }
 
-          // ======================================================
-          // 🔥 EXECUTION (DIRECT)
-          // ======================================================
           const nextRetry = (log.retry_count || 0) + 1;
 
           const executionLog = {

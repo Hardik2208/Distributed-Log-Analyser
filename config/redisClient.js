@@ -1,6 +1,14 @@
 const { createClient } = require('redis');
 
-const redisClient = createClient();
+const redisUrl = process.env.REDIS_URL;
+
+if (!redisUrl) {
+  throw new Error("REDIS_URL is not defined");
+}
+
+const redisClient = createClient({
+  url: redisUrl
+});
 
 redisClient.on('connect', () => {
   console.log('🔌 Redis connecting...');

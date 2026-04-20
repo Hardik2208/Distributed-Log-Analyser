@@ -5,9 +5,23 @@ const { connectRedis, redisClient } = require('../config/redisClient');
 const { processLog } = require('../processing/processLog');
 const { shouldRetry } = require('../control/circuitBreaker');
 
+// --------------------------------
+// ENV VALIDATION
+// --------------------------------
+const broker = process.env.KAFKA_BROKER;
+
+if (!broker) {
+  throw new Error("❌ KAFKA_BROKER is not defined");
+}
+
+console.log("🚀 MAIN CONSUMER connecting to Kafka:", broker);
+
+// --------------------------------
+// KAFKA INIT
+// --------------------------------
 const kafka = new Kafka({
   clientId: 'main-consumer',
-  brokers: ['localhost:9092'],
+  brokers: [broker],
 });
 
 const consumer = kafka.consumer({
@@ -20,6 +34,33 @@ const consumer = kafka.consumer({
 
 const producer = kafka.producer();
 
+// --------------------------------
+// CONNECTION HELPERS (RETRY ADDED)
+// --------------------------------
+async function connectConsumer(retries = 5) {
+  try {
+    await consumer.connect();
+    console.log("✅ Consumer connected");
+  } catch (err) {
+    console.log(`⏳ Retrying consumer connect... (${retries})`);
+    if (retries === 0) throw err;
+    await new Promise(res => setTimeout(res, 3000));
+    return connectConsumer(retries - 1);
+  }
+}
+
+async function connectProducer(retries = 5) {
+  try {
+    await producer.connect();
+    console.log("✅ Producer connected");
+  } catch (err) {
+    console.log(`⏳ Retrying producer connect... (${retries})`);
+    if (retries === 0) throw err;
+    await new Promise(res => setTimeout(res, 3000));
+    return connectProducer(retries - 1);
+  }
+}
+
 // ======================================================
 // 🔥 HIGH CONCURRENCY
 // ======================================================
@@ -29,7 +70,7 @@ const limit = pLimit(concurrency);
 // ======================================================
 // 🔥 LOG SAMPLING (IMPORTANT)
 // ======================================================
-const SAMPLE_RATE = 0.01; // 1%
+const SAMPLE_RATE = 0.01;
 
 function shouldLog() {
   return Math.random() < SAMPLE_RATE;
@@ -47,8 +88,8 @@ async function commitOffset(topic, partition, message) {
 // ======================================================
 async function run() {
   await connectRedis();
-  await consumer.connect();
-  await producer.connect();
+  await connectConsumer();
+  await connectProducer();
 
   await consumer.subscribe({ topic: 'logs', fromBeginning: false });
 
@@ -72,16 +113,10 @@ async function run() {
           const now = Date.now();
           const priority = log.priority || "LOW";
 
-          // ======================================================
-          // 🔴 SAMPLE INPUT VISIBILITY
-          // ======================================================
           if (shouldLog()) {
             console.log(`📥 IN id=${log.id} p=${priority}`);
           }
 
-          // ======================================================
-          // 🔴 SYSTEM STATE (can later cache if needed)
-          // ======================================================
           const [systemState, circuitState, avgLatency] = await Promise.all([
             redisClient.get("system:state"),
             redisClient.get("circuit:state"),
@@ -96,9 +131,6 @@ async function run() {
 
           const isExtreme = latency > 1500;
 
-          // ======================================================
-          // 🔴 LOAD SHEDDING
-          // ======================================================
           if (isOverloaded) {
 
             if (priority === "LOW") {
@@ -130,18 +162,12 @@ async function run() {
             }
           }
 
-          // ======================================================
-          // 🔴 NORMALIZATION
-          // ======================================================
           log.retry_count = log.retry_count || 0;
 
           log.ingestion_latency = now - log.timestamp;
           log.queue_entered_at = now;
           log.attempt_timestamp = now;
 
-          // ======================================================
-          // 🔥 EXECUTION
-          // ======================================================
           const result = await processLog(log);
 
           if (result?.status === "SUCCESS") {
@@ -154,9 +180,6 @@ async function run() {
 
             const allowed = await shouldRetry();
 
-            // ======================================================
-            // 🔴 CIRCUIT BREAKER CONTROL
-            // ======================================================
             if (!allowed) {
 
               if (priority === "LOW") {
@@ -179,9 +202,6 @@ async function run() {
               }
             }
 
-            // ======================================================
-            // 🔥 RETRY SEND
-            // ======================================================
             const retryNow = Date.now();
 
             if (shouldLog()) {
@@ -304,9 +324,6 @@ async function run() {
           }
         }
 
-        // ======================================================
-        // 🔥 ALWAYS COMMIT
-        // ======================================================
         await commitOffset(topic, partition, message);
 
       });

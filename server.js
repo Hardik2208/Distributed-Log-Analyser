@@ -7,7 +7,22 @@ const { startControlLoop } = require('./control/controlLoop');
 const app = express();
 app.use(express.json());
 
-// ----------------------
+// --------------------------------
+// ENV (DOCKER SAFE)
+// --------------------------------
+const PORT = process.env.PORT || 3000;
+const KAFKA_BROKER = process.env.KAFKA_BROKER;
+
+// 🔥 ADD THIS (visibility, no logic change)
+console.log("🌐 ENV CONFIG →", {
+  PORT,
+  KAFKA_BROKER,
+  REDIS_URL: process.env.REDIS_URL
+});
+
+// --------------------------------
+// REDIS SAFE WRAPPER
+// --------------------------------
 async function safeRedis(action, fallback = null) {
   try {
     if (!redisClient || !redisClient.isOpen) {
@@ -21,9 +36,9 @@ async function safeRedis(action, fallback = null) {
   }
 }
 
-// ----------------------
+// --------------------------------
 // DB CONTROL
-// ----------------------
+// --------------------------------
 app.post('/control/db/down', async (req, res) => {
   await safeRedis(() => redisClient.set('db:failure', '1'));
   res.json({ db: "DOWN" });
@@ -34,9 +49,9 @@ app.post('/control/db/up', async (req, res) => {
   res.json({ db: "UP" });
 });
 
-// ----------------------
+// --------------------------------
 // SYSTEM METRICS
-// ----------------------
+// --------------------------------
 app.get('/metrics/system', async (req, res) => {
   try {
     const metrics = await getSystemMetrics();
@@ -53,9 +68,9 @@ app.get('/metrics/system', async (req, res) => {
   }
 });
 
-// ----------------------
+// --------------------------------
 // LATEST WINDOW METRICS
-// ----------------------
+// --------------------------------
 app.get('/metrics/latest', async (req, res) => {
   try {
     const service = req.query.service || 'order';
@@ -89,7 +104,6 @@ app.get('/metrics/latest', async (req, res) => {
       window: latest,
 
       total_attempts: total,
-
       success: Number(data.success || 0),
       failures: Number(data.failure || 0),
       temporary_failures: Number(data.temporary || 0),
@@ -126,9 +140,9 @@ app.get('/metrics/latest', async (req, res) => {
   }
 });
 
-// ----------------------
+// --------------------------------
 // WINDOW METRICS
-// ----------------------
+// --------------------------------
 app.get('/metrics/window', async (req, res) => {
   try {
     const service = req.query.service || 'order';
@@ -141,7 +155,11 @@ app.get('/metrics/window', async (req, res) => {
     const result = [];
 
     for (const window of windows.map(Number).sort((a,b)=>b-a).slice(0,10)) {
-      const data = await safeRedis(() => redisClient.hGetAll(`${service}:${window}`), {});
+      const data = await safeRedis(
+        () => redisClient.hGetAll(`${service}:${window}`),
+        {}
+      );
+
       if (!data || Object.keys(data).length === 0) continue;
 
       const total = Number(data.total || 0);
@@ -169,15 +187,15 @@ app.get('/metrics/window', async (req, res) => {
 
         avg_latency:
           total ? Number(data.latencySum || 0) / total : 0,
-        
+
         avg_retry_delay:
-          Number(data.retryDelaySum || 0) / total,
+          total ? Number(data.retryDelaySum || 0) / total : 0,
 
         avg_queue_delay:
-          Number(data.queueDelaySum || 0) / total,
+          total ? Number(data.queueDelaySum || 0) / total : 0,
 
         avg_processing_time:
-          Number(data.processingTimeSum || 0) / total
+          total ? Number(data.processingTimeSum || 0) / total : 0
       });
     }
 
@@ -188,13 +206,9 @@ app.get('/metrics/window', async (req, res) => {
   }
 });
 
-// ======================================================
-// 🔴 NEW: ANOMALY ENDPOINTS (ONLY ADDITION)
-// ======================================================
-
-// ----------------------
-// ALL ANOMALIES
-// ----------------------
+// --------------------------------
+// ANOMALIES
+// --------------------------------
 app.get('/anomalies', async (req, res) => {
   try {
     const service = req.query.service || 'order';
@@ -205,11 +219,7 @@ app.get('/anomalies', async (req, res) => {
     );
 
     const parsed = data.map(d => {
-      try {
-        return JSON.parse(d);
-      } catch {
-        return null;
-      }
+      try { return JSON.parse(d); } catch { return null; }
     }).filter(Boolean);
 
     res.json({
@@ -223,9 +233,6 @@ app.get('/anomalies', async (req, res) => {
   }
 });
 
-// ----------------------
-// LATEST ANOMALY
-// ----------------------
 app.get('/anomalies/latest', async (req, res) => {
   try {
     const service = req.query.service || 'order';
@@ -235,15 +242,8 @@ app.get('/anomalies/latest', async (req, res) => {
       null
     );
 
-    if (!data) {
-      return res.json({ success: true, anomaly: null });
-    }
-
     let parsed = null;
-
-    try {
-      parsed = JSON.parse(data);
-    } catch {}
+    try { parsed = JSON.parse(data); } catch {}
 
     res.json({
       success: true,
@@ -255,11 +255,9 @@ app.get('/anomalies/latest', async (req, res) => {
   }
 });
 
-// ======================================================
-
-// ----------------------
+// --------------------------------
 // DLQ
-// ----------------------
+// --------------------------------
 app.get('/dlq/stats', async (req, res) => {
   try {
     const stats = await getDLQStats();
@@ -269,8 +267,10 @@ app.get('/dlq/stats', async (req, res) => {
   }
 });
 
-// ----------------------
-app.get('/health', async (req, res) => {
+// --------------------------------
+// HEALTH
+// --------------------------------
+app.get('/health', (req, res) => {
   res.json({
     status: "OK",
     redis: redisClient?.isOpen || false,
@@ -278,17 +278,45 @@ app.get('/health', async (req, res) => {
   });
 });
 
-// ----------------------
+// --------------------------------
+// START SERVER
+// --------------------------------
 async function start() {
-  await connectRedis();
+  try {
+    console.log("🔌 Connecting to Redis...");
+    await connectRedis();
 
-  await redisClient.set('db:failure', '0');
+    await redisClient.set('db:failure', '0');
 
-  startControlLoop("order");
+    // 🔥 ONLY CHANGE: make control loop safe
+    try {
+      console.log("🎛️ Starting control loop...");
+      startControlLoop("order");
+    } catch (err) {
+      console.error("⚠️ Control loop failed:", err.message);
+    }
 
-  app.listen(3000, () => {
-    console.log("🚀 Server running on 3000");
-  });
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+    });
+
+  } catch (err) {
+    console.error("🔥 SERVER START FAILED:", err);
+    process.exit(1);
+  }
 }
+
+// --------------------------------
+// GRACEFUL SHUTDOWN
+// --------------------------------
+process.on("SIGTERM", async () => {
+  console.log("🛑 Shutting down server...");
+  try {
+    if (redisClient?.isOpen) {
+      await redisClient.quit();
+    }
+  } catch {}
+  process.exit(0);
+});
 
 start();

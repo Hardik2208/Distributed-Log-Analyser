@@ -2,6 +2,18 @@
 
 ---
 
+## 🔥 Core Idea
+
+> **This system maintains stability under high load using feedback control and detects loss of control instead of load.**
+
+Unlike traditional systems that collapse under stress, this system:
+
+* **operates within defined limits**
+* **degrades gracefully**
+* **detects instability before failure**
+
+---
+
 ## 🧠 Problem
 
 Modern distributed log processing systems are designed to handle high-throughput data streams, but they often fail under real-world conditions such as high load and cascading failures. The primary issues observed in such systems include retry amplification, where failed requests are retried aggressively leading to exponential load increase, and queue saturation, where incoming requests exceed processing capacity, causing unbounded latency growth.
@@ -98,16 +110,27 @@ Unlike traditional systems that operate passively, this system actively regulate
 
 ![Load vs Latency](assets/load-vs-latency.png)
 
-Through extensive testing, the system exhibits the following behavior:
+| Load     | Behavior                                 |
+| -------- | ---------------------------------------- |
+| 1–2K/sec | Stable operation with low latency        |
+| 3–4K/sec | **Maximum sustainable throughput (MST)** |
+| ~5K/sec  | **Saturation begins (queue buildup)**    |
+| 10K/sec  | **Controlled saturation (no collapse)**  |
 
-| Load     | Behavior                                     |
-| -------- | -------------------------------------------- |
-| 1–2K/sec | Stable operation with low latency            |
-| 3–4K/sec | Maximum sustainable throughput               |
-| ~5K/sec  | Saturation begins, latency increases         |
-| 10K/sec  | Controlled saturation, system remains stable |
+---
 
-The key observation is that the system does not collapse under high load. Instead, it transitions into a controlled saturation state where latency increases but remains bounded.
+### 🔍 Behavior Summary (Critical)
+
+```text
+Without control:
+- Collapse at ~5K logs/sec
+- Latency → unbounded (queue explosion)
+
+With control:
+- Stable up to ~10K logs/sec
+- Latency bounded (~2–12s)
+- No system collapse
+```
 
 ---
 
@@ -117,7 +140,7 @@ Several important insights emerged from building and testing this system:
 
 * System failure is primarily caused by **queue saturation**, not retries
 * Latency is driven by **backlog accumulation**, not just processing time
-* High load alone is not a problem — lack of control is
+* High load alone is not a problem — **loss of control is**
 * Feedback mechanisms are essential for maintaining stability
 * Distributed systems require active regulation, not passive execution
 
@@ -141,7 +164,7 @@ These signals indicate sudden stress in the system:
 * Retry amplification spikes
 * Latency spikes
 
-They provide early warning but do not necessarily indicate failure.
+These indicate stress but NOT failure.
 
 ---
 
@@ -153,15 +176,15 @@ These signals detect sustained divergence over time:
 * Persistent queue pressure
 * Increasing retry instability
 
-These indicate that the system is losing control and approaching failure.
+These indicate **loss of control → real anomaly**
 
 ---
 
 ### Important Behavior
 
 * High load does NOT trigger anomalies
-* Only sustained instability triggers anomalies
-* The system avoids false positives by distinguishing stress from failure
+* Spikes do NOT trigger anomalies
+* Only sustained divergence triggers anomalies
 
 ---
 
@@ -169,7 +192,7 @@ These indicate that the system is losing control and approaching failure.
 
 ### Recovery Phase Distortion
 
-During recovery, an interesting issue was observed:
+During recovery, an important issue was observed:
 
 * Ingestion latency includes delays from past backlog
 * Pipeline latency reflects current processing conditions
@@ -194,17 +217,36 @@ This ensures accurate anomaly detection across different system phases.
 
 The system demonstrates significant improvements over naive implementations:
 
-* Retry amplification reduced from ~3x to ~1.1x
-* Latency growth changed from exponential to bounded
-* System remains stable under 10K logs/sec
+* Retry amplification reduced from **~3x → ~1.1x**
+* Latency growth changed from **exponential → bounded**
+* System remains stable under **10K logs/sec**
 * Retry storms are eliminated
 * System collapse is prevented
 
 ---
 
-## 🧠 System Behavior Model
+## 💣 How to Break the System (IMPORTANT)
 
-The system operates in three distinct phases:
+This system is designed to be tested under stress.
+
+### Increase load:
+
+* increase producer rate
+
+### Inject failures:
+
+* simulate failure in processing
+
+### Observe:
+
+* retry amplification
+* latency growth
+* queue buildup
+* anomaly detection
+
+---
+
+## 🧠 System Behavior Model
 
 ### 1. Overload Phase
 
@@ -256,4 +298,8 @@ Potential improvements include:
 * Kafka lag-based anomaly detection
 * Predictive failure analysis using trends
 * Long-term metric storage and analysis
+
+---
+
+## 🔗 Repository
 

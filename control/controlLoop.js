@@ -10,7 +10,20 @@ const { connectRedis, redisClient } = require('../config/redisClient');
 
 const { Kafka } = require('kafkajs');
 
-const kafka = new Kafka({ brokers: ['localhost:9092'] });
+// 🔥 FIX: use env instead of localhost
+const broker = process.env.KAFKA_BROKER;
+
+if (!broker) {
+  throw new Error("KAFKA_BROKER is not defined");
+}
+
+console.log("🎛️ Control Loop connecting to Kafka:", broker);
+
+const kafka = new Kafka({
+  clientId: 'control-loop',
+  brokers: [broker],
+});
+
 const producer = kafka.producer();
 
 // ----------------------
@@ -23,7 +36,15 @@ async function startControlLoop(service = "order") {
   let lastAnomaly = null;
 
   await connectRedis();
-  await producer.connect();
+
+  // 🔥 SAFE CONNECT (no crash loop)
+  try {
+    await producer.connect();
+    console.log("✅ Control Loop Kafka connected");
+  } catch (err) {
+    console.error("🔥 Kafka connection failed:", err.message);
+    return; // prevent loop from running broken
+  }
 
   setInterval(async () => {
     try {
@@ -54,13 +75,12 @@ async function startControlLoop(service = "order") {
       }
 
       // ======================================================
-      // 🔴 ANOMALY DETECTION (FIXED)
+      // 🔴 ANOMALY DETECTION
       // ======================================================
-      // ✅ ALWAYS run (fast signals need 1 window)
       const anomaly = detectAnomaly(windows);
 
       // ======================================================
-      // 🔴 CIRCUIT BREAKER (MOVED UP)
+      // 🔴 CIRCUIT BREAKER
       // ======================================================
       const circuitState = await updateCircuit(fast || smooth);
 
@@ -81,7 +101,7 @@ async function startControlLoop(service = "order") {
       }
 
       // ======================================================
-      // 🔴 PRODUCER CONTROL (MOVED UP FOR CONTEXT)
+      // 🔴 PRODUCER CONTROL
       // ======================================================
       let factor = 1.0;
 
@@ -94,7 +114,7 @@ async function startControlLoop(service = "order") {
       }
 
       // ======================================================
-      // 🔴 STORE ANOMALY (FIXED LOGIC)
+      // 🔴 STORE ANOMALY
       // ======================================================
       if (
         anomaly &&
@@ -148,7 +168,7 @@ async function startControlLoop(service = "order") {
       }
 
       // ======================================================
-      // 🔴 DEBUG (FIXED)
+      // 🔴 DEBUG
       // ======================================================
       if (
         !anomaly ||
