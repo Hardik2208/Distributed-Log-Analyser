@@ -6,17 +6,17 @@
 
 > Systems don’t fail because of high load — they fail because they lose control.
 
-This system is designed to **maintain control under stress**, not just process logs.
+This system is engineered to **maintain control under stress**, ensuring stability even under overload conditions.
 
 ---
 
 ## 🧠 Problem
 
-Modern log processing systems fail under real-world stress due to:
+Traditional distributed log systems fail under real-world stress due to:
 
 * Queue saturation → unbounded latency
-* Retry amplification → exponential load growth
-* No feedback control → blind execution
+* Retry amplification → exponential load increase
+* Lack of feedback → blind execution
 
 Result:
 
@@ -30,7 +30,7 @@ Result:
 * Maintain **bounded latency under overload**
 * Prevent **retry storms**
 * Detect **instability before failure**
-* Ensure **graceful degradation**
+* Enable **graceful recovery**
 
 ---
 
@@ -44,39 +44,38 @@ Producer → Kafka → Consumers → Retry Queue → DLQ → Processing → Redi
 
 ---
 
-## ⚙️ Key Design Decisions
+## ⚙️ Core Design Decisions
 
-| Problem              | Decision               | Why                               |
-| -------------------- | ---------------------- | --------------------------------- |
-| Retry storms         | Bounded retry (≤3)     | Prevent exponential amplification |
-| Failure loops        | Circuit breaker        | Stop wasteful retries             |
-| Queue explosion      | Adaptive backpressure  | Control ingestion rate            |
-| Duplicate processing | Redis idempotency      | Ensure correctness                |
-| Observability        | Redis metrics tracking | Fast and lightweight              |
+| Problem              | Solution                   | Impact                         |
+| -------------------- | -------------------------- | ------------------------------ |
+| Retry storms         | Bounded retry (≤3)         | Eliminates amplification loops |
+| Failure cascades     | Circuit breaker            | Prevents resource waste        |
+| Queue explosion      | Adaptive backpressure      | Stabilizes system under load   |
+| Duplicate processing | Redis idempotency          | Ensures correctness            |
+| Observability        | Real-time metrics tracking | Enables control decisions      |
 
 ---
 
-## 🧠 Control Algorithm
+## 🧠 Control Algorithm (Explicit)
 
 ```
 IF latency_avg(t) > 500ms 
-AND (latency_avg(t) - latency_avg(t-1)) > 100ms 
-FOR 3 intervals:
+AND Δlatency > 100ms over last 3 intervals:
     enable backpressure (-30%)
 
-IF retry_amp > 1.3 FOR 2 intervals:
+IF retry_amp > 1.3 for 2 intervals:
     throttle retries
 
 IF failure_rate > 8%:
     open circuit breaker
 
-IF latency_avg < 400ms FOR 5 intervals:
+IF latency < 400ms stable for 5 intervals:
     disable backpressure
 ```
 
 ---
 
-## 📊 Time-Series System Behavior (Real Execution Data)
+## 📊 Time-Series System Behavior (Observed Data)
 
 | Time | Input | Throughput | Queue | Avg Lat | P95 Lat | Retry | Failure | Control                       | State       |
 | ---- | ----- | ---------- | ----- | ------- | ------- | ----- | ------- | ----------------------------- | ----------- |
@@ -98,7 +97,7 @@ IF latency_avg < 400ms FOR 5 intervals:
 ### Without Control
 
 * Collapse at ~5K logs/sec
-* Latency becomes unbounded
+* Latency grows unbounded
 
 ### With Control
 
@@ -116,13 +115,15 @@ IF latency_avg < 400ms FOR 5 intervals:
 
 > Detect loss of control, not high load
 
-### Fast Signals (stress detection)
+### Signals
+
+**Fast Signals**
 
 * Latency spikes
 * Queue pressure
 * Retry amplification
 
-### Slow Signals (true failure)
+**Slow Signals**
 
 * Sustained latency growth
 * Persistent backlog
@@ -132,56 +133,70 @@ IF latency_avg < 400ms FOR 5 intervals:
 
 ## 💣 Failure Experiments
 
-| Scenario                | Expected Behavior  | Actual Behavior                        | Recovery |
-| ----------------------- | ------------------ | -------------------------------------- | -------- |
-| High failure injection  | Retry storm        | Retry capped (~1.3), breaker activated | ~40s     |
-| Consumer crash          | Data loss risk     | Reprocessing without duplication       | ~25s     |
-| Overload (10K logs/sec) | Collapse           | Controlled saturation, stable system   | ~60s     |
-| Retry flood             | Amplification loop | Retry bounded ≤1.2                     | ~30s     |
+| Scenario            | Expected           | Actual                                   | Recovery |
+| ------------------- | ------------------ | ---------------------------------------- | -------- |
+| High failure (~50%) | Retry storm        | Retry capped (~1.3), breaker triggered   | ~40s     |
+| Consumer crash      | Data loss          | Reprocessed via offsets (no duplication) | ~25s     |
+| Overload (10K/sec)  | Collapse           | Controlled saturation                    | ~60s     |
+| Retry flood         | Amplification loop | Retry bounded ≤1.2                       | ~30s     |
 
 ---
 
 ## ⚖️ Control vs No Control
 
-| Condition | Without Control | With Control |
-| --------- | --------------- | ------------ |
-| 5K load   | Collapse        | Stable       |
-| Latency   | Unbounded       | Bounded      |
-| Retry     | Explodes        | Controlled   |
-| Queue     | Infinite growth | Stabilized   |
+| Condition  | Without Control  | With Control   |
+| ---------- | ---------------- | -------------- |
+| Throughput | Collapses at ~5K | Stable at ~10K |
+| Latency    | Unbounded        | Bounded        |
+| Retry      | Explodes         | Controlled     |
+| Queue      | Infinite growth  | Stabilized     |
 
 ---
 
-## 🔍 Key Insights
+## ⚙️ Scaling Strategy (Critical Insight)
 
-* Queue saturation is the primary failure driver
-* Latency is dominated by backlog accumulation
-* High load is not failure — loss of control is
-* Feedback systems are essential for stability
+* Consumers scaled to **match Kafka partition parallelism**
+* Increasing consumers beyond partitions → **no throughput gain**
+* Producers scaled to **saturate ingestion without overwhelming broker**
+* System bottleneck identified as **queue saturation, not compute**
 
 ---
 
-## 🧪 Reproducibility
+## 🐳 Reproducibility (Dockerized Execution)
 
 ```
-# Start system
-docker-compose up
+docker-compose up --scale consumer=6 --scale retry-consumer=6 --scale producer=5
+```
 
-# Simulate load
+### Load Simulation
+
+```
 npm run simulate --rate=10000
+```
 
-# Observe logs
+### Logs
+
+```
 tail -f logs/system.log
 ```
 
 ---
 
+## 🧠 Key Insights
+
+* Queue saturation is the primary failure driver
+* Retry amplification is secondary but dangerous
+* Latency is dominated by backlog, not compute time
+* Stability requires **active control, not passive scaling**
+
+---
+
 ## 🧠 What This Demonstrates
 
-* Distributed system behavior under stress
-* Control-loop driven stability
+* Distributed systems under stress
+* Control-loop based system design
 * Failure-aware architecture
-* Production-level backend thinking
+* Real-world backend engineering thinking
 
 ---
 
